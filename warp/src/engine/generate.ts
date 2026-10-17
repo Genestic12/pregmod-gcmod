@@ -1,0 +1,418 @@
+/**
+ * THE FORGE, OFFLINE HALF — a whole person, with no model in the loop.
+ *
+ * This is deliberately the primary path, not the fallback. Warp runs with no API key at all: you
+ * get bodies, histories, temperaments, nervous systems and market prices out of a seeded stream,
+ * and the game is complete. When a model IS configured, engine/forge.ts takes what this produced
+ * and writes the interior over the top of it — voice, texture, the specific memory that explains
+ * the temperament — because a model handed a concrete sketch writes a person, and a model handed
+ * an empty prompt writes the average of everyone it has ever read.
+ *
+ * The body-first order matters. Nationality picks the palette; age and career pick the history;
+ * the history picks the temperament; the temperament picks the resting point. Generate in the
+ * other direction and you get forty women who are all quietly "guarded but kind" with randomised
+ * hair, which is what most character generators produce and why they all feel the same.
+ */
+import { reconcileAnatomy } from "./genitals";
+import type { Body, Bond, Health, Person, Persona, Psyche, Skills, Womb, Pronouns } from "./types";
+import { NATIONS, CAREERS, ORIGINS, NATION_WEIGHT, type Nation } from "../data/people";
+import { newPsyche, clamp } from "./psyche";
+import { rng, hash, type Rng } from "./rng";
+import { QUIRKS, FLAWS } from "../data/intimacy";
+import { buildOf, kgFor } from "./build";
+import { newFeet } from "./genitals";
+
+/** How common each thing is. Submissive and cumslut are the two the trade selects for, because the
+ *  trade selects for what sells; sadist and dom are rare in a population that is being sold. */
+const FETISH_POOL = [
+  { id: "submissive", w: 5 }, { id: "cumslut", w: 4 }, { id: "buttslut", w: 3 },
+  { id: "boobs", w: 3 }, { id: "humiliation", w: 2.5 }, { id: "masochist", w: 2 },
+  { id: "pregnancy", w: 1.5 }, { id: "dom", w: 1.2 }, { id: "sadist", w: 0.8 },
+];
+
+/**
+ * A PERSON'S ID COMES FROM HER SEED, NOT FROM THE CLOCK.
+ *
+ * This used to be `Date.now()` plus a counter, which looks harmless and is not. Person ids are
+ * threaded through the engine as identity, and identity is used for more than lookup:
+ *
+ *   · Every seeded RNG stream keyed on a person — conception, illness, a manager skimming — is
+ *     seeded on her id, so a clock-based id gave a different stream on every run and the game
+ *     stopped being reproducible from its seed the moment it touched a body.
+ *   · The thread detectors iterate pairs with `a.id >= b.id` to visit each pair once, so the order
+ *     the household is examined in came from wall-clock time too.
+ *
+ * The result was a test suite that passed locally and failed in CI about half the time, and a
+ * documented-deterministic engine that was not. Derived from the seed, all of that is stable: the
+ * same seed produces the same woman with the same name in the same order, every run, forever.
+ *
+ * Two hashes rather than one, salted differently, because a 32-bit id collides at about one in a
+ * hundred once a household has run a thousand people through it — and a collision here is two
+ * different women sharing a memory ledger, which is a save-corrupting bug that would surface once
+ * a month and never reproduce. Sixty-four bits puts it out of reach.
+ *
+ * A caller that passes no seed gets a random one, and an id derived from that — still random, but
+ * random in exactly one place instead of two. Callers that generate in bulk pass a seed with the
+ * index in it (`${seed}:${i}`), so distinctness is the caller's to keep, where it belongs.
+ */
+export function personId(seed: number | string): string {
+  const s = String(seed);
+  return `p${hash(s).toString(36)}${hash(`id:${s}`).toString(36)}`;
+}
+
+export interface GenOptions {
+  seed?: number | string;
+  nation?: string;
+  age?: number;
+  /** "female" | "male" | "futa" — the arrangement of parts, before any surgery. */
+  sex?: "female" | "male" | "futa";
+  career?: string;
+  origin?: string;
+  week?: number;
+  /** Bias the roll toward better or worse stock: markets differ, and so should what they hold. */
+  quality?: number;   // −1 … +1
+  central?: boolean;
+}
+
+export function generatePerson(opts: GenOptions = {}): Person {
+  const seed = opts.seed ?? Math.floor(Math.random() * 1e9);
+  const r = rng(seed);
+  const nation = opts.nation
+    ? NATIONS.find((n) => n.name === opts.nation) ?? r.weighted(NATIONS, (n) => n.weight)
+    : r.weighted(NATIONS, (n) => n.weight / NATION_WEIGHT);
+  const q = clamp(opts.quality ?? 0, -1, 1);
+  // The art pack draws a female body and the trade deals in women, so the default roll is female
+  // or futa. Plain male is still generatable, it just has to be asked for — the alternative was
+  // what the cheat screen turned up: a slave called Jonas, drawn as a woman.
+  const sex = opts.sex ?? (r.chance(0.9) ? "female" : "futa");
+  const age = opts.age ?? Math.round(clamp(r.normal(23, 5), 5, 46));
+  const female = sex !== "male";
+  const pronouns: Pronouns = female ? "she/her" : "he/him";
+
+  const name = r.pick(female ? nation.female : nation.male);
+  const surname = r.pick(nation.surnames);
+  const careerRec = opts.career
+    ? CAREERS.find((c) => c.name === opts.career) ?? r.pick(CAREERS)
+    : r.pick(CAREERS);
+  const originRec = opts.origin ? ORIGINS.find((o) => o.how === opts.origin) ?? r.pick(ORIGINS) : r.pick(ORIGINS);
+
+  const body = generateBody(r, nation, age, sex, q);
+  const persona = generatePersona(r, careerRec, originRec, q);
+  const psyche = generatePsycheFrom(r, originRec, persona);
+  const skills = generateSkills(r, careerRec, age, q);
+
+  const health: Health = {
+    health: Math.round(clamp(r.normal(20 + q * 25, 22), -60, 90)),
+    energy: Math.round(clamp(r.normal(70, 12), 20, 100)),
+    attrition: Math.max(0, Math.round(r.normal(age > 30 ? 12 : 4, 6))),
+    illness: r.chance(0.08) ? (r.int(1, 2) as 1 | 2) : 0,
+    drugs: [],
+    curatives: 0,
+    aphrodisiacs: 0,
+    addiction: 0,
+    injuries: [],
+    recovery_weeks: 0,
+    diet: "healthy",
+  };
+
+  const womb: Womb = {
+    fertility: female ? Math.round(clamp(r.normal(70 - Math.max(0, age - 30) * 2.5, 15), 0, 100)) : 0,
+    cycle_day: r.int(0, 27),
+    fertile_known: false,
+    fetuses: [],
+    weeks: 0,
+    contraceptives: false,
+    sterile: !female || r.chance(0.05),
+    uterus: female ? "natal" : "none",
+    births: age > 24 && r.chance(0.2) ? r.int(1, 2) : 0,
+    miscarriages: 0,
+    abortions: 0,
+    sired_by: {}, exposures: 0,
+  };
+
+  const bond: Bond = {
+    bond: originRec.bond + Math.round(r.normal(0, 6)),
+    fear: clamp(Math.round(r.normal(18, 10) - originRec.trust * 0.3), 0, 100),
+    resentment: clamp(Math.round(-originRec.devotion * 0.9 + r.normal(10, 8)), 0, 100),
+    hope: clamp(Math.round(r.normal(35, 14) + originRec.devotion * 0.4), 0, 100),
+    weeks_since_kindness: 4,
+    weeks_since_cruelty: 4,
+    read: { devotion: 0, trust: 0, label: "careless" },
+  };
+
+  const p: Person = {
+    id: personId(seed),
+    name,
+    surname,
+    pronouns,
+    age,
+    birth_week: (opts.week ?? 0) - age * 52,
+    physical_age: age,
+    origin: {
+      nationality: nation.name,
+      race: nation.race,
+      career: careerRec.name,
+      background: `${careerRec.arrives}; ${originRec.line}`,
+      acquired_week: opts.week ?? 0,
+      acquired_how: originRec.how,
+    },
+    body,
+    psyche,
+    persona,
+    skills,
+    health,
+    womb,
+    bond,
+    assignment: "rest",
+    rules_exempt: false,
+    rules_applied: [],
+    status: "owned",
+    clothes: "no clothing",
+    collar: "none",
+    shoes: "none",
+    chastity: { vagina: false, anus: false, penis: false },
+    economics: {
+      price_paid: 0, weeks_owned: 0, income_last_week: 0, income_lifetime: 0,
+      upkeep_last_week: 0, upkeep_lifetime: 0, customers_last_week: 0,
+    },
+    fame: { prestige: 0, why: "", porn_fame: 0, porn_focus: "" },
+    counters: {},
+    central: opts.central ?? false,
+  };
+  finishGenitals(p);
+  reconcileAnatomy(p);
+  return p;
+}
+
+/** Genital detail and feet, on their own random stream so adding them left every existing seed's
+ *  people exactly as they were. Sizes follow the original's spread: most cocks 2–5, a few tiny or
+ *  big; balls track the cock loosely; the scrotum starts fitted. */
+function finishGenitals(p: Person): void {
+  const r = rng(`genitals:${p.id}`);
+  const b = p.body;
+  if (b.dick) {
+    b.dick = r.weighted([1, 2, 3, 4, 5, 6, 7] as const, (d) => [0, 0.6, 2.5, 4, 3, 1.6, 0.6, 0.2][d]);
+    if (b.foreskin) b.foreskin = Math.max(1, b.dick + r.int(-1, 1));
+  }
+  if (b.balls) {
+    b.balls = Math.max(1, Math.min(7, Math.round((b.dick ?? 3) * 0.7 + r.int(0, 2))));
+    b.scrotum = b.balls + r.int(0, 1);
+  } else {
+    b.scrotum = 0;
+  }
+  if (b.vagina !== null) {
+    b.clit = r.weighted([0, 1, 2, 3] as const, (c) => [7, 2.2, 0.6, 0.15][c]);
+    b.vagina_lube = r.weighted([0, 1, 2] as const, (l) => [1, 5, 2][l]);
+  }
+  b.feet = newFeet(r, b.height_cm, !!b.dick && b.vagina === null);
+}
+
+function generateBody(r: Rng, nation: Nation, age: number, sex: "female" | "male" | "futa", q: number): Body {
+  const female = sex !== "male";
+  const height = Math.round(clamp(r.normal(nation.height + (female ? 0 : 13), 7), 140, 205));
+  const face = Math.round(clamp(r.normal(52 + q * 18, 15), 5, 99));
+  const boobs = female ? Math.round(clamp(r.normal(450 + q * 120, 220), 0, 2000)) : r.chance(0.1) ? 200 : 0;
+  const weight = Math.round(clamp(r.normal(q * -6, 22), -60, 80));
+  const weight_kg = kgFor(weight, height);
+
+  const skin = r.pick(nation.skin);
+  const hair = r.pick(nation.hair);
+  const eyes = r.pick(nation.eyes);
+  const hairLen = Math.round(clamp(r.normal(35, 22), 0, 120));
+
+  const body: Body = {
+    height_cm: height,
+    weight_kg,
+    weight,
+    muscle: Math.round(clamp(r.normal(5, 18), -60, 80)),
+    face,
+    face_shape: female ? r.pick(["normal", "normal", "cute", "sensual", "exotic", "androgynous"] as const) : r.pick(["masculine", "androgynous", "normal"] as const),
+    boobs,
+    boob_implant: 0,
+    nipples: r.pick(["cute", "cute", "tiny", "puffy", "huge", "inverted"] as const),
+    areolae: r.int(0, 2) as 0 | 1 | 2,
+    butt: Math.round(clamp(r.normal(female ? 3 : 2, 1.4), 1, 10)),
+    butt_implant: 0,
+    hips: r.pick([-1, 0, 0, 1, 1, 2] as const),
+    waist: Math.round(clamp(r.normal(female ? -20 : 10, 25), -100, 100)),
+    shoulders: r.pick([-1, 0, 0, 1] as const),
+    vagina: female ? r.int(0, 3) : null,
+    vagina_lube: female ? (r.int(0, 1) as 0 | 1) : 0,
+    clit: female ? (r.chance(0.85) ? 0 : 1) : 0,
+    labia: female ? (r.int(0, 2) as 0 | 1 | 2) : 0,
+    hymen: female && r.chance(0.18),
+    dick: sex === "female" ? null : r.int(2, 5),
+    foreskin: sex === "female" ? null : (r.chance(0.65) ? r.int(2, 5) : 0),
+    balls: sex === "female" ? null : r.int(2, 4),
+    prostate: sex === "female" ? 0 : 1,
+    anus: r.int(0, 2),
+    lactation: 0,
+    lactation_weeks: 0,
+    belly: 0,
+    belly_implant: 0,
+    belly_sag: 0,
+    skin,
+    hair_color: hair,
+    hair_length: hairLen,
+    hair_style: r.pick(["loose", "in a braid", "tied back", "cropped short", "shoulder-length and untidy", "pinned up"]),
+    pubic_hair: r.pick(["neat", "waxed", "hairless", "in a strip", "bushy"] as const),
+    eye_color: eyes,
+    eyes: r.chance(0.08) ? "nearsighted" : "normal",
+    ears: "normal",
+    voice: female ? 3 : 1,
+    teeth: r.chance(0.12) ? "crooked" : "normal",
+    marks: [],
+    appearance_facts: "",
+    appearance_now: "",
+  };
+  body.appearance_facts = describeBody(body, nation, age);
+  body.appearance_now = "wearing whatever she arrived in";
+  return body;
+}
+
+/** The bedrock look, as one sentence a narrator and a diffusion model can both use. Appended to,
+ *  never rewritten — a permanent change adds a clause; nothing edits the original. */
+/** Her ass in a few words, on the original's scale. */
+export function assWord(butt: number): string {
+  return butt <= 1 ? "a small, tight ass" : butt <= 2 ? "a pert ass" : butt <= 3 ? "a nicely rounded ass" : butt <= 4 ? "a big, round ass"
+    : butt <= 5 ? "a huge ass" : butt <= 7 ? "an enormous ass" : "an ass so huge it's hard to believe";
+}
+
+export function describeBody(b: Body, nation: Nation, age: number): string {
+  const w = buildOf(b.weight);
+  const build = w === "slim" ? (b.muscle > 30 ? "visibly strong" : "average build")
+    : { skinny: "skinny", thin: "thin", plump: "soft", chubby: "chubby", fat: "fat", obese: "very fat" }[w];
+  const chest = b.boobs > 1200 ? "enormous breasts" : b.boobs > 700 ? "big breasts" : b.boobs > 350 ? "full breasts" : b.boobs > 100 ? "small breasts" : "flat-chested";
+  const hair = b.hair_length > 60 ? `long ${b.hair_color} hair` : b.hair_length > 20 ? `${b.hair_color} hair to the shoulder` : `short ${b.hair_color} hair`;
+  return `${age}, ${nation.name}, ${b.height_cm}cm, ${build}. ${b.skin} skin, ${hair}, ${b.eye_color} eyes. ${chest}, ${assWord(b.butt)}.`;
+}
+
+function generatePersona(r: Rng, career: (typeof CAREERS)[number], origin: (typeof ORIGINS)[number], q: number): Persona {
+  const style = r.weighted(
+    ["secure", "anxious", "avoidant", "disorganized"] as const,
+    (s) => (s === "secure" ? 5 : s === "anxious" ? 3.5 : s === "avoidant" ? 3 : 1.5));
+
+  const underThreat = {
+    secure: "complains once and then gets on with it",
+    anxious: "gets clingy and keeps asking if she's done something wrong",
+    avoidant: "shuts down and tries to avoid you",
+    disorganized: "panics and can't decide whether to cling or run",
+  }[style];
+  const soothed = {
+    secure: "being told honestly what's going to happen",
+    anxious: "company and reassurance",
+    avoidant: "being left alone for a while",
+    disorganized: "a strict, predictable routine",
+  }[style];
+
+  const traitPool = [
+    "jokes around instead of giving a straight answer",
+    "suspicious of everyone",
+    "a neat freak",
+    "nervous and fidgety",
+    "says yes and then does what she wants anyway",
+    "evasive",
+    "shy, and slow to open up",
+    "eager to please when she's scared",
+    "holds grudges and keeps score",
+    "touchy-feely",
+    "giggles when she's nervous",
+    "self-conscious about her body",
+    "friendly and sociable",
+    "careful to follow instructions exactly",
+  ];
+  const valuePool = ["not being lied to", "her own privacy", "being useful", "her family, wherever they are",
+    "surviving", "the people she came in with", "not owing anyone", "being good at something",
+    "keeping her word", "her own body", "getting free someday"];
+  const texturePool = ["always feels cold", "loves birds", "hums to herself",
+    "can't sleep with the door open", "hates heights", "reads anything she can get", "afraid of elevators",
+    "good with her hands", "sings badly and often", "likes plants"];
+
+  return {
+    background: `She was a ${career.name}, and she's ${career.arrives}.`,
+    life_history: "",
+    core_traits: r.shuffle([...traitPool]).slice(0, 3),
+    values: r.shuffle([...valuePool]).slice(0, 2),
+    speech_pattern: r.pick([
+      "quiet, and talks in short sentences",
+      "rambles and takes a while to get to the point",
+      "stiffly polite",
+      "talks fast and interrupts herself",
+      "terse",
+      "friendly and a bit too familiar",
+    ]),
+    attachment: { style, under_threat: underThreat, soothed_by: soothed },
+    conscience: clamp(+r.normal(0.68, 0.2).toFixed(2), 0.05, 1),
+    intelligence: r.weighted(["impaired", "slow", "average", "sharp", "brilliant"] as const,
+      (i) => (i === "average" ? 5 : i === "sharp" ? 3 : i === "slow" ? 2.5 : i === "brilliant" ? 1 : 0.8)),
+    education: clamp(Math.round(r.normal(40 + (career.smart ?? 0) * 15 + q * 10, 20)), 0, 100),
+    texture: r.shuffle([...texturePool]).slice(0, 2),
+    attracted_to: r.weighted(["men", "women", "anyone", "no one"] as const,
+      (a) => (a === "men" ? 5 : a === "women" ? 2 : a === "anyone" ? 2.5 : 0.4)),
+    taste: r.pick([
+      "tall, quiet, older people",
+      "competent people",
+      "gentle, soft people",
+      "dangerous people",
+      "smart people",
+      "people who remind her of home",
+    ]),
+    // The base game's own lists. Most people have one thing; a few have two; `none` is a real
+    // answer and roughly a third of the population gets it, because a world where everybody has a
+    // kink is a world where the kink means nothing.
+    fetishes: (() => {
+      const roll = r();
+      if (roll < 0.32) return [{ name: "none", strength: 0, known: false }];
+      const first = r.weighted(FETISH_POOL, (f) => f.w);
+      const out = [{ name: first.id, strength: Math.round(clamp(r.normal(55, 25), 10, 100)), known: false }];
+      if (r.chance(0.18)) {
+        const second = r.weighted(FETISH_POOL.filter((f) => f.id !== first.id), (f) => f.w);
+        out.push({ name: second.id, strength: Math.round(clamp(r.normal(35, 18), 10, 80)), known: false });
+      }
+      return out;
+    })(),
+    quirk: r.chance(0.42) ? { id: r.pick(QUIRKS).id, known: false } : undefined,
+    flaw: r.chance(0.38) ? { id: r.pick(FLAWS).id, known: false, worn: 0 } : undefined,
+    preferred_hole: { hole: r.weighted(["mouth", "vagina", "anus", "boobs"] as const, (h) => (h === "vagina" ? 4 : h === "mouth" ? 3 : h === "anus" ? 1.5 : 1)), known: false },
+    gregariousness: +clamp(r.normal(0.5, 0.22), 0.02, 1).toFixed(2),
+  };
+}
+
+/** The resting point comes from who they are and how they arrived — not from a flat roll.
+ *  Somebody taken off a street starts braced; somebody who signed the paperwork does not. */
+function generatePsycheFrom(r: Rng, origin: (typeof ORIGINS)[number], persona: Persona): Psyche {
+  const base = r.normal(0.5, 2.2);
+  const originPull = origin.trust / 22;            // −1.8 … +0.5
+  const styleShift = persona.attachment.style === "secure" ? 0.8 : persona.attachment.style === "anxious" ? -0.6 : persona.attachment.style === "disorganized" ? -1.1 : -0.3;
+  const capacity = +clamp(base + originPull + styleShift, -6, 6).toFixed(2);
+  const recovery = +clamp(r.normal(0.18, 0.08), 0.02, 0.45).toFixed(3);
+  const p = newPsyche(capacity, recovery);
+  // Arrival is not a resting state: they get here braced by however they got here.
+  p.relaxation = +clamp(capacity + origin.trust / 18, -10, 10).toFixed(2);
+  p.prev_relaxation = p.relaxation;
+  p.mood = origin.trust < -20 ? "braced" : "flat";
+  p.libido = Math.round(clamp(r.normal(45, 18), 5, 100));
+  return p;
+}
+
+function generateSkills(r: Rng, career: (typeof CAREERS)[number], age: number, q: number): Skills {
+  const base = () => Math.round(clamp(r.normal(8 + q * 6 + (age - 5) * 0.7, 10), 0, 60));
+  const s: Skills = {
+    oral: base(), vaginal: base(), anal: Math.round(base() * 0.6), penetrative: Math.round(base() * 0.4),
+    whoring: Math.round(base() * 0.5), entertainment: base(), combat: Math.round(base() * 0.3),
+    management: {},
+  };
+  for (const [k, v] of Object.entries(career.skills)) {
+    if (k === "management") { s.management.general = v; continue; }
+    (s as unknown as Record<string, number>)[k] = clamp(((s as unknown as Record<string, number>)[k] ?? 0) + v, 0, 100);
+  }
+  return s;
+}
+
+/** A batch, for markets and for the opening roster. Seeded off one string so the same week always
+ *  offers the same people until you change something. */
+export function generateBatch(seed: string, n: number, opts: GenOptions = {}): Person[] {
+  const out: Person[] = [];
+  for (let i = 0; i < n; i++) out.push(generatePerson({ ...opts, seed: `${seed}:${i}` }));
+  return out;
+}

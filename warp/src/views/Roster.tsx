@@ -1,0 +1,692 @@
+/**
+ * THE ROSTER, AND THE PERSON.
+ *
+ * The list answers "who do I have and what state are they in" at a glance; the panel answers "why
+ * is she like that", which is the question the old game could not answer at any price because the
+ * answer was distributed across every passage that had ever touched her.
+ */
+import { freeLine } from "../engine/freed";
+import PhotoPortrait from "./PhotoPortrait";
+import MenialsPanel from "./Menials";
+import SubTabs from "./SubTabs";
+import { sane, recoveryNote, rushCost, rushRecovery } from "../engine/health";
+import { DRUGS, canStart } from "../data/drugs";
+import { describeGenitals, describeFeet, mobility, dickCM, ballsWord, vaginaWord, anusWord, feetOf } from "../engine/genitals";
+import { useMemo, useState, useRef } from "react";
+import { Search, X } from "lucide-react";
+import { useGame } from "../lib/game";
+import { Button, Card, Chip, Empty, Field, Meter, Money, Section, Sheet, cx } from "../lib/ui";
+import type { Assignment, Person } from "../engine/types";
+import { explain, read } from "../engine/obedience";
+import { band, wear, aperture, perception } from "../engine/psyche";
+import { explainFor } from "../engine/society";
+import { assignToFacility, allowedAssignments, isMinor, setAssignment, MINOR_FACILITIES } from "../engine/rules";
+import { ASSIGNMENTS } from "../data/assignments";
+import { FACILITIES, FACILITY_BY_ID } from "../data/facilities";
+import { PROCEDURES } from "../engine/health";
+import { MODIFICATIONS, GARMENT_BY_NAME } from "../data/wardrobe";
+import { sell } from "../engine/market";
+import { enrichPerson } from "../engine/forge";
+import { getEdge } from "../engine/social";
+import Interact from "./Interact";
+import Dressing from "./Dressing";
+import Surgery from "./Surgery";
+import FeetArt from "./FeetArt";
+import { IDOL_IMAGES, idolOf, type IdolImage } from "../engine/idols";
+import { OpenMoments, Reaction as MomentReaction } from "./MomentCard";
+import HerPanel from "./HerPanel";
+import { romanceOf, RUNG_BY_ID, inHousehold, isKeeper, isPartner, wasYours } from "../engine/romance";
+import { paintPortrait, paintRealistic } from "../engine/turn";
+import { getLocalImage, modelsAvailable } from "../config";
+import { POSES, restingPose, type Pose } from "../lib/rig";
+import { renderDoll } from "../lib/dollrender";
+import { askHer } from "../engine/consult";
+import SlaveArt, { SlaveHead } from "./SlaveArt";
+import { practise, skill } from "../engine/player";
+import { buildOf } from "../engine/build";
+
+type Sort = "name" | "devotion" | "trust" | "health" | "income" | "trouble";
+
+export default function Roster() {
+  const { save, mutate } = useGame();
+  const [q, setQ] = useState("");
+  const [sort, setSort] = useState<Sort>("trouble");
+  const [openId, setOpenId] = useState<string | null>(null);
+  const [withId, setWithId] = useState<string | null>(null);
+  const [dressId, setDressId] = useState<string | null>(null);
+  const [showFreed, setShowFreed] = useState(() => { try { return localStorage.getItem("warp:show-freed") === "1"; } catch { return false; } });
+  const toggleFreed = () => setShowFreed((v) => { try { localStorage.setItem("warp:show-freed", v ? "0" : "1"); } catch { /* private window */ } return !v; });
+  // Women who were yours and are free now, other than a partner (who is in the household list).
+  const freed = useMemo(() => Object.values(save.people).filter((p) => wasYours(p) && !inHousehold(save, p) && !isPartner(save, p)).sort((a, b) => (b.exit_week ?? 0) - (a.exit_week ?? 0)), [save]);
+
+  const people = useMemo(() => {
+    const list = Object.values(save.people).filter((p) => inHousehold(save, p) || isPartner(save, p));
+    const filtered = q ? list.filter((p) => (p.name + " " + p.assignment + " " + p.origin.nationality).toLowerCase().includes(q.toLowerCase())) : list;
+    const score = (p: Person) => {
+      const r = read(p, save.memory[p.id]);
+      switch (sort) {
+        case "name": return 0;
+        case "devotion": return -r.devotion;
+        case "trust": return -r.trust;
+        case "health": return p.health.health;
+        case "income": return -p.economics.income_last_week;
+        default: return -(r.flight_risk * 100 + (p.psyche.state !== "intact" ? 60 : 0) + Math.max(0, -p.health.health));
+      }
+    };
+    // She who holds your collar is always first, then the woman you married.
+    const first = (p: Person) => (isKeeper(save, p) ? 2 : isPartner(save, p) ? 1 : 0);
+    return [...filtered].sort((a, b) => first(b) - first(a) || (sort === "name" ? a.name.localeCompare(b.name) : score(a) - score(b)));
+  }, [save, q, sort]);
+
+  return (
+    <>
+      <SubTabs id="people" tabs={[
+        { id: "household", label: "Your household", badge: people.length || undefined, render: () => (<>
+      <div className="flex items-center gap-2 mb-4">
+        <div className="relative flex-1">
+          <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 dim" />
+          <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="search" className="pl-9" />
+        </div>
+        <select value={sort} onChange={(e) => setSort(e.target.value as Sort)} className="w-auto">
+          <option value="trouble">by trouble</option>
+          <option value="name">by name</option>
+          <option value="devotion">by devotion</option>
+          <option value="trust">by trust</option>
+          <option value="health">by health</option>
+          <option value="income">by earnings</option>
+        </select>
+      </div>
+
+      {people.length ? (
+        <div className="grid gap-2.5 sm:grid-cols-2">
+          {people.map((p) => <RosterCard key={p.id} p={p} onOpen={() => setOpenId(p.id)} onWith={() => setWithId(p.id)} />)}
+        </div>
+      ) : <Empty>Nobody yet. Buy someone at the Market.</Empty>}
+
+      {freed.length ? (
+        <div className="mt-5">
+          <button className="foldhead" aria-expanded={showFreed} onClick={toggleFreed}>
+            Freed <span className="fold-count">{freed.length}</span>
+          </button>
+          {showFreed ? (
+            <div className="grid gap-2.5 sm:grid-cols-2 mt-1">
+              {freed.map((p) => (
+                <Card key={p.id} onClick={() => setOpenId(p.id)} className="py-3 opacity-80">
+                  <div className="flex items-center gap-3">
+                    <SlaveHead person={p} size={42} />
+                    <div className="flex-1 min-w-0">
+                      <div className="text-[13.5px]">{p.name} <span className="text-[11px] dim font-mono">{p.age}</span></div>
+                      <div className="text-[11.5px] dim truncate">{p.free_life ? freeLine(save, p).replace(`${p.name}, `, "") : `${p.exit_note ? `${p.exit_note} · ` : ""}week ${p.exit_week}`}</div>
+                    </div>
+                  </div>
+                </Card>
+              ))}
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+
+        </>) },
+        { id: "menials", label: "Menials", badge: save.menials?.owned ? save.menials.owned.toLocaleString() : undefined, render: () => <MenialsPanel /> },
+      ]} />
+      <Sheet open={!!openId} onClose={() => setOpenId(null)} title={openId ? save.people[openId]?.name ?? "" : ""} wide>
+        {openId && save.people[openId] ? <PersonPanel id={openId} onClose={() => setOpenId(null)} onWith={() => setWithId(openId)} onDress={() => setDressId(openId)} /> : null}
+      </Sheet>
+      {withId && save.people[withId] ? <Interact id={withId} onClose={() => setWithId(null)} /> : null}
+      {dressId && save.people[dressId] ? <Dressing id={dressId} onClose={() => setDressId(null)} /> : null}
+    </>
+  );
+}
+
+/** ASK HER SOMETHING. Out of scene, in her own voice, out of her own knowledge, and it leaves no
+ *  trace: no memory forms, no bond moves, no clock advances. A channel where you can ask a woman
+ *  what she thinks without it becoming an event is a different thing from another scene. */
+function AskHer({ id }: { id: string }) {
+  const { save } = useGame();
+  const [q, setQ] = useState("");
+  const [says, setSays] = useState("");
+  const [busy, setBusy] = useState(false);
+  const p = save.people[id];
+  if (!p) return null;
+
+  async function ask() {
+    if (!q.trim() || busy) return;
+    setBusy(true);
+    setSays("");
+    const res = await askHer(save, id, q.trim());
+    setSays(res.says);
+    setBusy(false);
+  }
+
+  return (
+    <Card>
+      <div className="text-[11px] uppercase tracking-wider dim mb-2">ask her a question in private (doesn't affect anything)</div>
+      <div className="flex gap-2">
+        <input value={q} placeholder={`ask ${p.name} anything`} onChange={(e) => setQ(e.target.value)}
+          onKeyDown={(e) => { if (e.key === "Enter") void ask(); }} />
+        <Button size="sm" onClick={ask} disabled={busy || !q.trim()}>{busy ? "…" : "ask"}</Button>
+      </div>
+      {says ? <p className="font-prose text-[15px] leading-relaxed mt-3">{says}</p> : null}
+      {!modelsAvailable() ? <div className="text-[11px] dim mt-2">Needs a model set up in Settings. For offline talk, use "Be with her" → Talk.</div> : null}
+    </Card>
+  );
+}
+
+/** Anything already worn by somebody in the household is paid for. */
+function ownedGarments(save: ReturnType<typeof useGame>["save"]): Set<string> {
+  const worn = new Set<string>();
+  for (const p of Object.values(save.people)) { worn.add(p.clothes); worn.add(p.collar); worn.add(p.shoes); }
+  return worn;
+}
+
+function RosterCard({ p, onOpen, onWith }: { p: Person; onOpen: () => void; onWith: () => void }) {
+  const { save } = useGame();
+  const r = read(p, save.memory[p.id]);
+  const fac = p.facility ? save.arcology.facilities[p.facility] : undefined;
+  return (
+    <Card onClick={onOpen} className="py-3">
+      <div className="flex items-start gap-3">
+        <SlaveHead person={p} size={54} />
+        <div className="flex-1 min-w-0">
+          <div className="flex items-baseline gap-2">
+            <span className="text-[14px]">{p.name}</span>
+            <span className="text-[11px] dim font-mono">{p.age} · {p.origin.nationality}</span>
+            {isKeeper(save, p) ? <Chip tone="good">owns you</Chip> : p.status === "free" ? <Chip tone="good">free</Chip> : null}
+            {p.status === "indentured" ? <Chip>indentured {p.indenture_weeks}w</Chip> : null}
+            {p.age < 18 ? <Chip>child</Chip> : null}
+            {p.romance && p.romance.standing !== "property" && !isKeeper(save, p) ? <Chip on>{RUNG_BY_ID[p.romance.standing].name.toLowerCase()}</Chip> : null}
+          </div>
+          <div className="text-[11.5px] dim truncate mt-0.5">{fac ? fac.name : p.assignment}</div>
+        </div>
+        <div className="text-right shrink-0">
+          <div className="text-[11px]" style={{ color: p.psyche.state !== "intact" ? "var(--danger)" : "var(--text-mid)" }}>
+            {p.psyche.state !== "intact" ? p.psyche.state : band(p.psyche)}
+          </div>
+          <div className="text-[11px] dim font-mono">{p.economics.income_last_week ? `¤${p.economics.income_last_week}` : ""}</div>
+          {p.age >= 5 ? (
+            <button className="btn btn-primary btn-sm mt-1.5" onClick={(e) => { e.stopPropagation(); onWith(); }}>be with her</button>
+          ) : null}
+        </div>
+      </div>
+      <div className="grid grid-cols-3 gap-2 mt-3">
+        <Meter value={r.devotion} range={[-100, 100]} label="devotion" />
+        <Meter value={r.trust} range={[-100, 100]} label="trust" />
+        <Meter value={p.health.health} range={[-100, 100]} label="health" />
+      </div>
+      {r.fragility > 0.6 || r.flight_risk > 0.3 ? (
+        <div className="flex gap-1.5 mt-2.5">
+          {r.fragility > 0.6 ? <Chip tone="bad" title="how much of her obedience is fear">fear-held {Math.round(r.fragility * 100)}%</Chip> : null}
+          {r.flight_risk > 0.3 ? <Chip tone="bad">flight {Math.round(r.flight_risk * 100)}%</Chip> : null}
+        </div>
+      ) : null}
+    </Card>
+  );
+}
+
+function PersonPanel({ id, onClose, onWith, onDress }: { id: string; onClose: () => void; onWith: () => void; onDress: () => void }) {
+  const { save, mutate } = useGame();
+  const [tab, setTab] = useState<"her" | "read" | "body" | "theatre" | "work" | "history">("read");
+  const [together, setTogether] = useState<string | null>(null);
+  const [painting, setPainting] = useState(false);
+  const [forging, setForging] = useState(false);
+  const [pose, setPose] = useState<Pose | undefined>(undefined);
+  const [note, setNote] = useState("");
+  const doll = useRef<SVGSVGElement>(null);
+  const p = save.people[id];
+  const r = read(p, save.memory[id]);
+  const mem = save.memory[id];
+  // Not yours to assign, dress or operate on: she owns you, or she is free.
+  const mine = isKeeper(save, p) || p.status === "free";
+
+  return (
+    <div>
+      {/* Her, then the numbers about her — in that order, at that ratio. */}
+      <div className="flex gap-4 mb-4">
+        <div className="card-2 shrink-0 px-1" style={{ width: "clamp(118px, 34vw, 190px)" }}>
+          <SlaveArt person={p} height="clamp(270px, 78vw, 430px)" pose={pose} svgRef={doll} />
+        </div>
+        <div className="flex-1 min-w-0">
+          {p.body.portrait_url ? <img src={p.body.portrait_url} alt="" className="w-full max-h-40 object-cover rounded-lg mb-2" /> : null}
+          <PhotoPortrait id={id} body={doll} />
+          <p className="font-prose text-[13.5px] leading-snug">{p.body.appearance_facts}</p>
+          <p className="text-[12px] dim mt-1">{p.clothes === "no clothing" ? "Naked." : `Wearing ${p.clothes}.`}{p.body.appearance_now && !/^wearing whatever/.test(p.body.appearance_now) ? ` ${p.body.appearance_now}.` : ""}</p>
+          <div className="grid grid-cols-1 gap-2 mt-3">
+            <Meter value={r.devotion} range={[-100, 100]} label={`devotion · ${r.label}`} />
+            <Meter value={r.trust} range={[-100, 100]} label={`trust · ${r.trust_label}`} />
+            <Meter value={p.health.health} range={[-100, 100]} label="health" />
+          </div>
+        </div>
+      </div>
+      <div className="flex flex-wrap items-center gap-2 mb-4">
+        {p.romance && p.romance.standing !== "property" ? <Chip on>{RUNG_BY_ID[p.romance.standing].name}</Chip> : null}
+        <Chip>{p.origin.nationality}</Chip>
+        <Chip>{p.age}</Chip>
+        <Chip>{p.pronouns}</Chip>
+        <Chip on>{band(p.psyche)}</Chip>
+        {p.womb.fetuses.length ? <Chip>{p.womb.weeks}w pregnant</Chip> : null}
+        {p.body.lactation ? <Chip>lactating</Chip> : null}
+        <span className="ml-auto text-[11px] dim font-mono">{p.status === "free" ? `free since week ${p.exit_week ?? "?"}` : `owned ${p.economics.weeks_owned}w`}</span>
+        {getLocalImage() ? (
+          <>
+            <Button size="sm" kind="ghost" disabled={painting} onClick={async () => {
+              setPainting(true); setNote("");
+              try { await paintPortrait(save, id); mutate(() => {}); }
+              catch (e) { setNote((e as Error).message); }
+              setPainting(false);
+            }}>{painting ? "painting…" : p.body.portrait_url ? "repaint" : "paint her"}</Button>
+            {/* The realistic pass runs over the figure on the left rather than over a description
+                of her, so what comes back is this body in this pose. See lib/dollrender.ts. */}
+            <Button size="sm" kind="ghost" disabled={painting} onClick={async () => {
+              setPainting(true); setNote("");
+              try {
+                if (!doll.current) throw new Error("she is still being drawn — try again in a moment");
+                const shot = await renderDoll(doll.current);
+                await paintRealistic(save, id, shot.dataUrl, { onProgress: setNote });
+                mutate(() => {});
+                setNote("");
+              } catch (e) { setNote((e as Error).message); }
+              setPainting(false);
+            }}>make her real</Button>
+          </>
+        ) : null}
+      </div>
+
+      {/* Pose is a real control, not a toy: it drives the art, the aria label, and — when the
+          realistic pass runs — the ControlNet image, so what the sampler returns is her in it. */}
+      <div className="flex flex-wrap gap-1.5 items-center mb-4">
+        <span className="text-[11px] uppercase tracking-wider dim mr-1">pose</span>
+        <Chip on={!pose} onClick={() => setPose(undefined)}>as she is</Chip>
+        {POSES.map((x) => (
+          <Chip key={x.id} on={pose?.id === x.id} title={x.reads} onClick={() => setPose(x)}>{x.name}</Chip>
+        ))}
+        <span className="text-[11.5px] dim basis-full mt-1">{(pose ?? restingPose(p)).reads}.</span>
+      </div>
+
+      {note ? <Card className="mb-4 text-[12.5px] acc">{note}</Card> : null}
+
+      {recoveryNote(save, p) ? (
+        <Card className="mb-4">
+          <div className="text-[13px]" style={{ color: "var(--warn)" }}>She is {recoveryNote(save, p)}.</div>
+          <div className="text-[11.5px] dim mt-1">
+            Recovery goes down each time you end the week. Assigning her to the Clinic speeds it up, a Nurse managing the Clinic speeds it more, and curatives at full dose take off another week.
+          </div>
+          <div className="flex flex-wrap gap-2 mt-2">
+            <Button size="sm" disabled={save.arcology.cash < rushCost(save, p)} onClick={() => mutate((s) => {
+              const why = rushRecovery(s, s.people[id]);
+              setNote(why ? `Not done: ${why}.` : `${p.name} gets intensive care and is back on her feet.`);
+            })}>intensive care now · ¤{rushCost(save, p).toLocaleString()}</Button>
+            {p.health.curatives < 2 ? (
+              <Button size="sm" kind="ghost" onClick={() => mutate((s) => { s.people[id].health.curatives = 2; })}>full curatives</Button>
+            ) : null}
+          </div>
+        </Card>
+      ) : null}
+
+      <div className="flex gap-2 mb-4">
+        {p.age >= 5 && (inHousehold(save, p) || isPartner(save, p)) ? <Button kind="primary" className="flex-1" onClick={onWith}>{isKeeper(save, p) ? "Go to her" : "Be with her"}</Button> : null}
+        {mine ? null : <Button className="flex-1" onClick={onDress}>Dress her</Button>}
+      </div>
+      {mine ? <div className="text-[12px] dim -mt-2 mb-4">{isKeeper(save, p) ? "She owns you." : isPartner(save, p) ? "She's free, and your equal." : "She's free now."} You can {isKeeper(save, p) ? "go to" : "be with"} her, ask her things and see how she is; what she wears, where she works and what's done to her body are hers to decide.</div> : null}
+
+      <div className="flex flex-wrap gap-1 mb-4">
+        {(([["read", "how she is"], ["her", "you and her"], ["body", "body"], ["theatre", "surgery"], ["work", "work"], ["history", "history"]] as const).filter(([t]) => !mine || !["theatre", "work"].includes(t))).map(([t, label]) => (
+          <Button key={t} size="sm" kind={tab === t ? "primary" : "ghost"} onClick={() => setTab(t)}>{label}</Button>
+        ))}
+      </div>
+
+      {tab === "her" && <HerPanel id={id} />}
+      {tab === "theatre" && !mine && <Surgery id={id} />}
+
+      {tab === "read" && (
+        <div className="space-y-4">
+          <AskHer id={id} />
+          <OpenMoments person={id} title="Left unfinished with her" />
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+            <Meter value={r.devotion} range={[-100, 100]} label={`devotion — ${r.label}`} />
+            <Meter value={r.trust} range={[-100, 100]} label={`trust — ${r.trust_label}`} />
+            <Meter value={p.psyche.relaxation} range={[-10, 10]} label="relaxation" />
+            <Meter value={p.health.health} range={[-100, 100]} label="health" />
+          </div>
+
+          <Section title="Background">
+            <Card>
+              <ul className="space-y-2 text-[13px] leading-relaxed">
+                {explain(p, mem).map((line, i) => <li key={i} className="flex gap-2"><span className="acc">·</span><span>{line}</span></li>)}
+              </ul>
+            </Card>
+          </Section>
+
+          <Section title="Why she obeys">
+            <Card>
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                <Meter value={p.bond.bond} range={[-100, 100]} label="bond (slow, sticky)" />
+                <Meter value={p.bond.fear} range={[0, 100]} invert label="fear (fast, brittle)" />
+                <Meter value={p.bond.resentment} range={[0, 100]} invert label="resentment" />
+                <Meter value={p.bond.hope} range={[0, 100]} label="hope" />
+              </div>
+              <p className="text-[11.5px] dim mt-3">Fear drops about 15% a week unless you keep it up. Bond stays.</p>
+            </Card>
+          </Section>
+
+          <Section title="Mental state">
+            <Card>
+              <div className="text-[12.5px] space-y-1.5 mid">
+                <div>Resting point <span className="font-mono hi">{p.psyche.capacity.toFixed(1)}</span> (born {p.psyche.capacity_born.toFixed(1)}) · recovery <span className="font-mono">{p.psyche.recovery.toFixed(2)}</span>/tick</div>
+                <div>Attachment: <span className="hi">{p.persona.attachment.style}</span> — under threat she {p.persona.attachment.under_threat}. Settled by {p.persona.attachment.soothed_by}.</div>
+                <div>Conscience <span className="font-mono">{p.persona.conscience.toFixed(2)}</span> — {p.persona.conscience <= 0.35 ? "other people's experience does not register as mattering. Calm makes her effective, not kinder." : "other people's pain lands on her."}</div>
+                <div>Sees: {perception(p.psyche, p.persona.conscience).note}</div>
+                <div>Speech: {aperture(p.psyche).note}</div>
+                {wear(p.psyche) > 0.2 ? <div className="bad">Worn {Math.round(wear(p.psyche) * 100)}% — ordinary friction has stopped landing.</div> : null}
+                {p.psyche.active_states.length ? <div>Holding: {p.psyche.active_states.join(", ")}</div> : null}
+              </div>
+            </Card>
+          </Section>
+
+          <Section title="What your future societies think of her">
+            <Card>
+              {explainFor(save, p).length
+                ? <ul className="text-[12.5px] space-y-1 mid">{explainFor(save, p).map((l, i) => <li key={i}>{l}</li>)}</ul>
+                : <span className="text-[12.5px] dim">No future society has an opinion about her yet.</span>}
+            </Card>
+          </Section>
+        </div>
+      )}
+
+      {tab === "body" && (
+        <div className="space-y-4">
+          {isMinor(p) ? <Card className="text-[12px] mid">She is {p.age}. Nothing on this page applies to her.</Card> : null}
+          <Card>
+            <p className="font-prose text-[14.5px] leading-relaxed">{p.body.appearance_facts}</p>
+            <p className="text-[12.5px] dim mt-2">{p.body.appearance_now}</p>
+          </Card>
+          <Card>
+            <div className="text-[10.5px] uppercase tracking-wider dim mb-1">Between her legs</div>
+            <p className="font-prose text-[14px] leading-relaxed">{describeGenitals(p)}</p>
+            <div className="text-[10.5px] uppercase tracking-wider dim mt-3 mb-1">Feet</div>
+            <FeetArt person={p} />
+            <p className="font-prose text-[14px] leading-relaxed mt-2">{describeFeet(p)}</p>
+            {mobility(p).level ? <p className="text-[12.5px] mt-2" style={{ color: "var(--warn)" }}>Mobility: {mobility(p).note}.</p> : null}
+          </Card>
+          <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+            {[["height", `${p.body.height_cm}cm`], ["weight", `${p.body.weight_kg}kg`], ["build", buildOf(p.body.weight) === "slim" && p.body.muscle > 25 ? "strong" : buildOf(p.body.weight)],
+              ["face", `${p.body.face}/100`], ["breasts", `${p.body.boobs}cc${p.body.boob_implant ? " (implants)" : ""}`], ["butt", `${p.body.butt}/10`],
+              ["hair", `${p.body.hair_color}, ${p.body.hair_length}cm`], ["eyes", p.body.eye_color], ["skin", p.body.skin],
+              ...(p.body.dick ? [["cock", `${p.body.dick} · ${dickCM(p.body.dick)}cm`]] : []),
+              ...(p.body.balls ? [["balls", `${p.body.balls} · ${ballsWord(p.body.balls)}`], ["scrotum", `${p.body.scrotum ?? p.body.balls}`]] : []),
+              ...(p.body.vagina !== null ? [["pussy", `${p.body.vagina} · ${vaginaWord(p.body.vagina, p.body.hymen)}`], ["clit / labia", `${p.body.clit} / ${p.body.labia}`]] : []),
+              ["anus", `${p.body.anus} · ${anusWord(p.body.anus)}`], ["feet", `EU ${feetOf(p).size}${feetOf(p).heels_clipped ? " · clipped" : ""}`]].map(([k, v]) => (
+              <div key={k} className="card-2 px-3 py-2">
+                <div className="text-[10.5px] uppercase tracking-wider dim">{k}</div>
+                <div className="text-[13px] font-mono">{v}</div>
+              </div>
+            ))}
+          </div>
+          {p.body.marks.length ? (
+            <Section title="Marks"><Card><ul className="text-[12.5px] mid space-y-1">{p.body.marks.map((m, i) => <li key={i}>{m.what} — {m.where} (wk {m.week})</li>)}</ul></Card></Section>
+          ) : null}
+          <Section title="What she is wearing">
+            <Card>
+              <div className="text-[13px]">{p.clothes}{p.collar && p.collar !== "none" && p.collar !== "no collar" ? `, ${p.collar}` : ""}{p.shoes && p.shoes !== "none" && p.shoes !== "barefoot" ? `, ${p.shoes}` : ""}{p.legwear && p.legwear !== "bare legs" ? `, ${p.legwear}` : ""}</div>
+              <div className="text-[11.5px] dim mt-1">
+                {[p.clothes, p.collar, p.shoes].map((n) => GARMENT_BY_NAME[n]).filter(Boolean).map((g) => (
+                  `${g!.name}: ×${g!.appeal.toFixed(2)} on what she earns${g!.relaxation ? `, ${g!.relaxation > 0 ? "easier" : "harder"} on her` : ""}`
+                )).join(" · ")}
+              </div>
+              <Button size="sm" className="mt-3" onClick={onDress}>Open the dressing room</Button>
+            </Card>
+          </Section>
+
+          {isMinor(p) ? null : <Section title="Marking her">
+            <div className="grid gap-2 sm:grid-cols-2">
+              {MODIFICATIONS.map((m) => (
+                <div key={m.id} className="card-2 p-3 flex items-center gap-3">
+                  <div className="flex-1">
+                    <div className="text-[13px]">{m.name}</div>
+                    <div className="text-[11px] dim font-mono">¤{m.cost} · {m.where}{m.resented > 3 ? " · she will not forgive this quickly" : ""}</div>
+                  </div>
+                  <Button size="sm" disabled={save.arcology.cash < m.cost}
+                    onClick={() => mutate((s) => {
+                      const person = s.people[id];
+                      s.arcology.cash -= m.cost;
+                      person.body.marks.push({ kind: m.kind, where: m.where, what: m.name, week: s.arcology.week });
+                      person.psyche.relaxation = Math.max(-10, person.psyche.relaxation + m.relaxation);
+                      if (m.resented) {
+                        person.bond.resentment = Math.min(100, person.bond.resentment + m.resented * 1.5);
+                        person.bond.weeks_since_cruelty = 0;
+                      }
+                    })}>do it</Button>
+                </div>
+              ))}
+            </div>
+          </Section>}
+
+          {isMinor(p) ? null : <Section title="Procedures">
+            <div className="grid gap-2 sm:grid-cols-2">
+              {PROCEDURES.map((proc) => (
+                <div key={proc.id} className="card-2 p-3 flex items-center gap-3">
+                  <div className="flex-1">
+                    <div className="text-[13px]">{proc.name}</div>
+                    <div className="text-[11px] dim font-mono">
+                      <Money n={-proc.cost} /> · {Math.max(0, Math.round(proc.recovery * skill.medicine(save)))}w recovery · {Math.round(proc.toll * skill.medicine(save))} health
+                    </div>
+                  </div>
+                  <Button size="sm" disabled={save.arcology.cash < proc.cost || p.health.recovery_weeks > 0}
+                    onClick={() => mutate((s) => {
+                      const person = s.people[id];
+                      s.arcology.cash -= proc.cost;
+                      proc.apply(person);
+                      const med = skill.medicine(s);
+                      person.health.health = Math.max(-100, person.health.health - proc.toll * med);
+                      person.health.recovery_weeks = sane(person.health.recovery_weeks) + Math.max(0, Math.round(proc.recovery * med));
+                      practise(s, "medicine", 2);
+                      for (const m of person.body.marks) if (!m.week) m.week = s.arcology.week;
+                      if (proc.resented) {
+                        person.bond.resentment = Math.min(100, person.bond.resentment + proc.resented * 2);
+                        person.bond.weeks_since_cruelty = 0;
+                      }
+                    })}>do it</Button>
+                </div>
+              ))}
+            </div>
+          </Section>}
+        </div>
+      )}
+
+      {tab === "work" && !mine && (
+        <div className="space-y-4">
+          {isMinor(p) ? (
+            <Card className="text-[12px] mid">
+              {p.name} is {p.age}. Rest, the nursery, the schoolroom and medical care are the entire list
+              of things she can be assigned to, and the gate is in the engine rather than in this dropdown —
+              a standing order cannot route around it either.
+            </Card>
+          ) : null}
+          <Field label="Assignment">
+            <select value={p.assignment} onChange={(e) => mutate((s) => {
+              const person = s.people[id];
+              assignToFacility(s, person, undefined);
+              setAssignment(s, person, e.target.value as Assignment);
+            })}>
+              {allowedAssignments(p, ASSIGNMENTS.map((a) => a.id)).map((a) => {
+                const def = ASSIGNMENTS.find((x) => x.id === a)!;
+                return <option key={a} value={a}>{def.label}</option>;
+              })}
+            </select>
+          </Field>
+          {p.assignment === "be an idol" || (p.idol && p.idol.fans > 0) ? (
+            <Card>
+              <div className="flex items-baseline gap-2">
+                <span className="text-[13.5px]">Idol</span>
+                <span className="font-mono text-[13px]">{(p.idol?.fans ?? 0).toLocaleString()} fans</span>
+                <span className="text-[11px] dim">peak {(p.idol?.peak ?? 0).toLocaleString()} · {p.idol?.weeks ?? 0} weeks</span>
+              </div>
+              <div className="flex flex-wrap gap-1.5 mt-2">
+                {(Object.keys(IDOL_IMAGES) as IdolImage[]).map((k) => (
+                  <button key={k} title={IDOL_IMAGES[k]} className={cx("chip !text-[12px]", (p.idol?.image ?? "sweet") === k && "on")} onClick={() => mutate((s) => { idolOf(s.people[id]).image = k; })}>{k}</button>
+                ))}
+              </div>
+              <div className="text-[11.5px] dim mt-1.5">{IDOL_IMAGES[p.idol?.image ?? "sweet"]}</div>
+            </Card>
+          ) : null}
+          <Field label="Facility" hint="A facility overrides the assignment above with its own work.">
+            <select value={p.facility ?? ""} onChange={(e) => mutate((s) => assignToFacility(s, s.people[id], e.target.value || undefined))}>
+              <option value="">— none —</option>
+              {FACILITIES.filter((f) => save.arcology.facilities[f.id]?.level > 0 && (!isMinor(p) || MINOR_FACILITIES.includes(f.id))).map((f) => {
+                const built = save.arcology.facilities[f.id];
+                return <option key={f.id} value={f.id} disabled={built.workers.length >= built.capacity && p.facility !== f.id}>
+                  {f.name} ({built.workers.length}/{built.capacity})
+                </option>;
+              })}
+            </select>
+          </Field>
+          {p.facility && FACILITY_BY_ID[p.facility]?.manager ? (
+            <Button size="sm" kind={save.arcology.facilities[p.facility].manager === id ? "primary" : undefined}
+              onClick={() => mutate((s) => {
+                const f = s.arcology.facilities[p.facility!];
+                f.manager = f.manager === id ? undefined : id;
+              })}>
+              {save.arcology.facilities[p.facility].manager === id ? `she is the ${FACILITY_BY_ID[p.facility].manager!.title}` : `make her the ${FACILITY_BY_ID[p.facility].manager!.title}`}
+            </Button>
+          ) : null}
+
+          <Section title="Skills">
+            <Card>
+              <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+                {(["oral", "vaginal", "anal", "whoring", "entertainment", "combat"] as const).map((k) => (
+                  <Meter key={k} value={p.skills[k]} label={k} />
+                ))}
+                <Meter value={p.persona.education} label="education" />
+              </div>
+            </Card>
+          </Section>
+
+          <Section title="Regimen">
+            <Card>
+              <Field label="Diet">
+                <select value={p.health.diet} onChange={(e) => mutate((s) => { s.people[id].health.diet = e.target.value as Person["health"]["diet"]; })}>
+                  {["healthy", "restricted", "fattening", "muscle building", "slimming", "cleansing"].map((d) => <option key={d}>{d}</option>)}
+                </select>
+              </Field>
+              <div className="grid grid-cols-2 gap-3">
+                <Field label={`Curatives (${p.health.curatives})`}>
+                  <input type="range" min={0} max={2} value={p.health.curatives} onChange={(e) => mutate((s) => { s.people[id].health.curatives = Number(e.target.value) as 0 | 1 | 2; })} />
+                </Field>
+                <Field label={`Aphrodisiacs (${p.health.aphrodisiacs})`} hint={p.health.addiction > 20 ? `dependent: ${Math.round(p.health.addiction)}` : undefined}>
+                  <input type="range" min={0} max={3} value={p.health.aphrodisiacs} onChange={(e) => mutate((s) => { s.people[id].health.aphrodisiacs = Number(e.target.value) as 0 | 1 | 2 | 3; })} />
+                </Field>
+              </div>
+              <div className="text-[10.5px] uppercase tracking-wider dim mt-2 mb-1">Growth drugs and hormones</div>
+              <div className="flex flex-wrap gap-2 mb-2">
+                {DRUGS.filter((d) => !(d.hyper && save.content?.hyper === false)).map((d) => {
+                  const on = p.health.drugs.includes(d.id);
+                  const why = on ? null : canStart(save, p, d.id);
+                  return (
+                    <Chip key={d.id} on={on} title={`${d.note}. ¤${d.cost}/week.${why ? ` Not now: ${why}.` : ""}`}
+                      onClick={() => { if (!on && why) return; mutate((s) => { const h = s.people[id].health; h.drugs = on ? h.drugs.filter((x) => x !== d.id) : [...h.drugs, d.id]; }); }}>
+                      <span className={!on && why ? "dim" : undefined}>{d.name.toLowerCase()}</span>
+                    </Chip>
+                  );
+                })}
+              </div>
+              {p.health.drugs.length ? (
+                <ul className="text-[11.5px] mid mb-2 space-y-0.5">
+                  {p.health.drugs.map((x) => <li key={x}><span className="hi">{x}</span> — {DRUGS.find((d) => d.id === x)?.note}</li>)}
+                </ul>
+              ) : null}
+              <div className="flex flex-wrap gap-2 mt-1">
+                <Chip on={p.womb.contraceptives} onClick={() => mutate((s) => { s.people[id].womb.contraceptives = !s.people[id].womb.contraceptives; })}>contraceptives</Chip>
+                {p.body.vagina !== null ? <Chip on={p.chastity.vagina} onClick={() => mutate((s) => { s.people[id].chastity.vagina = !s.people[id].chastity.vagina; })}>pussy chastity</Chip> : null}
+                {p.body.dick ? <Chip on={p.chastity.penis} onClick={() => mutate((s) => { s.people[id].chastity.penis = !s.people[id].chastity.penis; })}>cock cage</Chip> : null}
+                <Chip on={p.chastity.anus} onClick={() => mutate((s) => { s.people[id].chastity.anus = !s.people[id].chastity.anus; })}>anal chastity</Chip>
+                <Chip on={p.rules_exempt} onClick={() => mutate((s) => { s.people[id].rules_exempt = !s.people[id].rules_exempt; })}>exempt from standing orders</Chip>
+              </div>
+            </Card>
+          </Section>
+
+          <Section title="Money">
+            <Card>
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-[12px]">
+                <div><div className="dim">last week</div><Money n={p.economics.income_last_week} /></div>
+                <div><div className="dim">upkeep</div><Money n={-p.economics.upkeep_last_week} /></div>
+                <div><div className="dim">lifetime</div><Money n={p.economics.income_lifetime - p.economics.upkeep_lifetime} sign /></div>
+                <div><div className="dim">paid for her</div><Money n={-p.economics.price_paid} /></div>
+              </div>
+            </Card>
+          </Section>
+
+          <div className="flex gap-2">
+            <Button kind="danger" onClick={() => { mutate((s) => { sell(s, s.people[id]); }); onClose(); }}>sell her</Button>
+            {modelsAvailable() && !p.persona.voice ? (
+              <Button disabled={forging} onClick={async () => {
+                setForging(true);
+                await enrichPerson(save, save.people[id]);
+                mutate(() => {});
+                setForging(false);
+              }}>{forging ? "writing…" : "forge her interior"}</Button>
+            ) : null}
+          </div>
+        </div>
+      )}
+
+      {tab === "history" && (
+        <div className="space-y-4">
+          <Card>
+            <div className="text-[12.5px] mid space-y-1">
+              <div><span className="dim">was</span> a {p.origin.career}</div>
+              <div><span className="dim">how</span> {p.origin.background}</div>
+              <div><span className="dim">acquired</span> week {p.origin.acquired_week}</div>
+            </div>
+            {p.persona.background ? <p className="font-prose text-[14px] leading-relaxed mt-3">{p.persona.background}</p> : null}
+          </Card>
+          {p.persona.voice?.example_lines?.length ? (
+            <Section title="How she sounds">
+              <Card><ul className="font-prose text-[14px] space-y-1.5">{p.persona.voice.example_lines.map((l, i) => <li key={i}>&ldquo;{l}&rdquo;</li>)}</ul></Card>
+            </Section>
+          ) : null}
+          <Section title="Memories">
+            {mem?.episodic.length ? (
+              <div className="space-y-1.5">
+                {[...mem.episodic].sort((a, b) => b.week - a.week).slice(0, 14).map((m) => (
+                  <div key={m.id} className="card-2 px-3 py-2 flex gap-3 items-baseline">
+                    <span className="font-mono text-[11px] dim shrink-0">wk {m.week}</span>
+                    <span className="text-[12.5px] flex-1" style={{ opacity: 0.4 + m.decay * 0.6 }}>{m.content}</span>
+                    <span className="text-[10.5px] dim shrink-0">{m.charge}{m.core ? " · core" : ""}</span>
+                    <button className="text-[11px] dim underline shrink-0" title="Correct what she remembers; she'll remember it this way from now on" onClick={() => {
+                      const t = window.prompt("What she remembers:", m.content);
+                      if (t && t.trim() && t.trim() !== m.content) mutate((s) => { const x = s.memory[id]?.episodic.find((e) => e.id === m.id); if (x) x.content = t.trim(); });
+                    }}>edit</button>
+                    <button className="text-[11px] dim underline shrink-0" title="She forgets this; it won't come up in scenes again" onClick={() => mutate((s) => { const pm = s.memory[id]; if (pm) pm.episodic = pm.episodic.filter((e) => e.id !== m.id); })}>forget</button>
+                  </div>
+                ))}
+              </div>
+            ) : <Empty>Nothing yet.</Empty>}
+          </Section>
+          {mem?.beliefs.length ? (
+            <Section title="Beliefs">
+              <Card><ul className="font-prose text-[14px] space-y-1.5">{mem.beliefs.map((b, i) => <li key={i}>&ldquo;{b.text}&rdquo; <span className="dim text-[11px] font-sans">({b.strength})</span></li>)}</ul></Card>
+            </Section>
+          ) : null}
+          {together && save.people[together] ? (
+            <MomentReaction key={together} auto label={`Call ${p.name} and ${save.people[together].name} in`} seed={{ person: id, others: [together], title: `${p.name} and ${save.people[together].name}`, source: "pair",
+              happened: `You call ${p.name} and ${save.people[together].name} into your office together. ${(() => { const e = save.edges.find((x) => x.from === id && x.to === together); return e?.roles.length ? `${p.name} is ${save.people[together].name}'s ${e.roles.join(", ")}.` : e && e.warmth > 30 ? "They're close." : e && e.warmth < -30 ? "They can't stand each other." : ""; })()} They stand in front of your desk, waiting.` }} />
+          ) : null}
+          <Section title="Who she knows">
+            {save.edges.filter((e) => e.from === id && (e.warmth || e.roles.length)).length ? (
+              <div className="space-y-1.5">
+                {save.edges.filter((e) => e.from === id).sort((a, b) => Math.abs(b.warmth) - Math.abs(a.warmth)).slice(0, 8).map((e) => (
+                  <div key={e.to} className="card-2 px-3 py-2 flex items-center gap-3">
+                    <span className="text-[12.5px] flex-1">{save.people[e.to]?.name ?? e.to}{e.roles.length ? ` — ${e.roles.join(", ")}` : ""}</span>
+                    <div className="w-20"><Meter value={e.warmth} range={[-100, 100]} showValue={false} /></div>
+                    <span className="text-[11px] dim font-mono w-8 text-right">{Math.round(e.warmth)}</span>
+                    {save.people[e.to] && (save.people[e.to].status === "owned" || save.people[e.to].status === "indentured") && save.people[e.to].age >= 5 && p.age >= 5
+                      ? <button className="btn btn-sm btn-ghost !px-2" title="Call them both in" onClick={() => setTogether(e.to)}>both</button> : null}
+                  </div>
+                ))}
+              </div>
+            ) : <Empty>She hasn't got to know anyone yet.</Empty>}
+          </Section>
+        </div>
+      )}
+    </div>
+  );
+}

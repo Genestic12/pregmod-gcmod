@@ -1,0 +1,248 @@
+/**
+ * EVENTS THE ENGINE DID NOT AUTHOR.
+ *
+ * The hand-written events in engine/events.ts are the spine — they fire without a model, they are
+ * deterministic, and they cover the situations an arcology reliably produces. This file is the
+ * other half: a model, pointed at ONE specific woman's actual record, inventing the situation that
+ * her particular combination of fetish, flaw, history, standing and week would actually throw up.
+ *
+ * It is built for a LOCAL model and says so. The situations this game wants are explicit, and a
+ * hosted model will decline them, water them down, or write around the edges — which produces the
+ * exact failure the genre's audience notices immediately. Point the narrator slot at KoboldCpp or
+ * llama-server, put an uncensored model behind it, and this becomes the part of the game that
+ * cannot be exhausted.
+ *
+ * ── THE GUARDRAIL, AND WHY IT IS SHAPED LIKE THIS ────────────────────────────────────────────
+ *
+ * The model writes the SITUATION and the WORDING of the options. It does not write the
+ * consequences. Every option carries an `effect` drawn from the closed table below, the engine
+ * resolves it, and anything unrecognised is dropped. So an uncensored model can be as inventive as
+ * it likes about what is happening in the room and it still cannot invent a state change, break an
+ * invariant, reach a person it was not given, or touch anybody the age gate excludes.
+ */
+import { powerBetween } from "./self";
+import { coarsen, REGISTER_TAIL } from "./register";
+import { memoryLine } from "./memory";
+import { agreementsBrief, calledBy } from "./agreements";
+import { deedsBrief } from "./deeds";
+import { mannerBrief } from "./manner";
+import type { PendingEvent, Person, SaveState } from "./types";
+import { call, parseJson } from "../llm";
+import { modelsAvailable, isLocalModel } from "../config";
+import { clamp, shove, addState } from "./psyche";
+import { applyTreatment, read } from "./obedience";
+import { remember } from "./memory";
+import { startRumor } from "./social";
+import { shiftDominion, romanceOf } from "./romance";
+import { resolveAct } from "./intimacy";
+import { FETISH_BY_ID, ACT_BY_ID } from "../data/intimacy";
+import { condition } from "./prompts";
+import { describeGenitals, describeFeet, anatomyLock } from "./genitals";
+import { worldBrief } from "./world";
+import { HOUSE_STYLE } from "./prompts";
+import { PLAIN_RULES } from "./style";
+import { chronicle, chronicleBrief, closeHooks, openHooks } from "./chronicle";
+import { changeRoom, roomLine, roomWish } from "./rooms";
+import { EXTRA_BY_ID } from "../data/rooms";
+import { lockUp } from "./governor";
+
+/** THE CLOSED TABLE. A generated option may name one of these and nothing else. */
+export const DYNAMIC_EFFECTS: Record<string, { note: string; run: (s: SaveState, p: Person, value?: string | number) => string }> = {
+  kindness: { note: "you're kind to her", run: (s, p, v) => { applyTreatment(p, { kind: "kindness", size: Number(v) || 4, why: "how you handled it" }, s.arcology.week); shove(p.psyche, 0.8); return "she's surprised and grateful"; } },
+  cruelty: { note: "you're cruel to her", run: (s, p, v) => { applyTreatment(p, { kind: "cruelty", size: Number(v) || 5, why: "how you handled it" }, s.arcology.week); shove(p.psyche, -1.5, { hard: true }); return "she takes it, and resents you for it"; } },
+  coercion: { note: "you punish her to enforce the rules", run: (s, p, v) => { applyTreatment(p, { kind: "coercion", size: Number(v) || 4, why: "punished to enforce the rules" }, s.arcology.week); return "she gets the message"; } },
+  recognition: { note: "you treat her like a person", run: (s, p, v) => { applyTreatment(p, { kind: "recognition", size: Number(v) || 5, why: "you treated her like a person" }, s.arcology.week); return "she appreciates being treated like a person"; } },
+  promise_kept: { note: "you do the thing you said you would", run: (s, p, v) => { applyTreatment(p, { kind: "promise_kept", size: Number(v) || 6, why: "you kept your word" }, s.arcology.week); return "you kept your word, and she appreciates it"; } },
+  promise_broken: { note: "you go back on it", run: (s, p, v) => { applyTreatment(p, { kind: "promise_broken", size: Number(v) || 6, why: "you went back on it" }, s.arcology.week); return "she's lost faith in your promises"; } },
+  act: { note: "it becomes a scene — name an act id", run: (s, p, v) => { const out = resolveAct(s, p, String(v)); return "error" in out ? "nothing came of it" : `${ACT_BY_ID[String(v)]?.what ?? "it happened"} — she ${out.landing} it`; } },
+  arouse: { note: "she is wound up by it", run: (_s, p, v) => { p.psyche.arousal = clamp(p.psyche.arousal + (Number(v) || 20), 0, 100); return "she's very turned on"; } },
+  dominion_up: { note: "she gets her way", run: (s, p, v) => { shiftDominion(s, p, Number(v) || 6, "she got her way"); return "she got her way"; } },
+  dominion_down: { note: "she is put back in her place", run: (s, p, v) => { shiftDominion(s, p, -(Number(v) || 6), "she was put back in her place"); return "she's been put back in her place"; } },
+  cash: { note: "it costs or makes money — value is the amount, negative to spend", run: (s, _p, v) => { const n = Number(v) || -2000; s.arcology.cash += n; return `¤${Math.abs(n).toLocaleString()} ${n < 0 ? "spent" : "made"}`; } },
+  rep: { note: "the arcology's opinion moves", run: (s, _p, v) => { const n = Number(v) || -200; s.arcology.rep = Math.max(0, s.arcology.rep + n); return `standing ${n >= 0 ? "+" : ""}${n}`; } },
+  rumor: { note: "it gets around — value is what people say", run: (s, p, v) => { startRumor(s, String(v ?? `something about ${p.name}`), { about: p.id, salience: 7 }); return "everyone's heard about it by morning"; } },
+  scar: { note: "she carries it permanently — value is the memory in her terms", run: (s, p, v) => { const mem = s.memory[p.id]; if (mem) remember(mem, { content: String(v ?? "the thing that happened"), week: s.arcology.week, importance: 9, charge: "sharp", core: true }); addState(p.psyche, "what happened", s.arcology.week); return "she'll never forget it"; } },
+  room_gift: { note: "you give her something for her room; value is one of the ROOM ITEM ids", run: (s, p, v) => { const id = String(v ?? ""); const wish = roomWish(s, p); const line = EXTRA_BY_ID[id] ? changeRoom(s, p, { extra: id }) : wish?.extra ? changeRoom(s, p, { extra: wish.extra }) : wish?.axis ? changeRoom(s, p, { axis: wish.axis, level: wish.level }) : ""; return line || "her room stays as it is"; } },
+  room_take: { note: "you take something out of her room as a punishment; value is one of the ROOM ITEM ids she has", run: (s, p, v) => { const have = p.room?.extras ?? []; const id = have.includes(String(v)) ? String(v) : have.find((x) => (EXTRA_BY_ID[x]?.comfort ?? 0) > 0); if (id) return changeRoom(s, p, { remove: id }); if ((p.room?.levels.bed ?? 0) > -1) return changeRoom(s, p, { axis: "bed", level: -1 }); return "there's nothing left in her room to take"; } },
+  imprison: { note: "you have her locked in a cell", run: (s, p) => lockUp(s, p, "locked in a cell") },
+  nothing: { note: "you do not engage", run: () => "you did nothing" },
+};
+
+interface GeneratedEvent {
+  title?: string;
+  hook?: string;
+  situation?: string;
+  options?: { label?: string; note?: string; effect?: string; value?: string | number }[];
+}
+
+/** Who is worth building a situation around this week — the one with the most live material on
+ *  her record, rather than a random pick. */
+export function pickSubject(s: SaveState): Person | null {
+  const pool = Object.values(s.people).filter((p) => (p.status === "owned" || p.status === "indentured") && p.age >= 5);
+  if (!pool.length) return null;
+  const score = (p: Person): number => {
+    const r = read(p, s.memory[p.id]);
+    let n = 0;
+    n += Math.abs(p.psyche.relaxation) * 0.6;
+    n += p.bond.resentment / 12;
+    n += p.psyche.arousal / 25;
+    n += (p.romance && p.romance.standing !== "property") ? 6 : 0;
+    n += p.persona.fetishes.some((f) => f.strength > 60) ? 4 : 0;
+    n += p.persona.flaw && !p.persona.flaw.known ? 3 : 0;
+    n += r.flight_risk * 8;
+    n += (s.memory[p.id]?.episodic.length ?? 0) / 8;
+    n += p.psyche.active_states.length * 2;
+    return n;
+  };
+  return pool.sort((a, b) => score(b) - score(a))[0];
+}
+
+/** The dossier the model gets. Everything specific, nothing generic — a model handed "a slave"
+ *  writes the average of every slave it has ever read, and a model handed THIS record writes her. */
+export function dossier(s: SaveState, p: Person): string {
+  const r = read(p, s.memory[p.id]);
+  const rom = romanceOf(p);
+  const mem = s.memory[p.id];
+  const fetish = p.persona.fetishes.filter((f) => f.name !== "none").map((f) => `${f.name} (${f.strength}${f.known ? ", you know" : ", you do not know yet"})`).join(", ");
+  const lines = [
+    `HER: ${p.name}, ${p.age}, ${p.origin.nationality}. Was a ${p.origin.career}. ${p.origin.background}`,
+    `BODY: ${p.body.appearance_facts} Currently: ${p.body.appearance_now}. Wearing ${p.clothes}.`,
+    `GENITALS: ${describeGenitals(p)}`,
+    `ANATOMY (hard rule): ${anatomyLock(p)}`,
+    agreementsBrief(s, p),
+    mannerBrief(s, p),
+    powerBetween(s, p),
+    `SHE CALLS YOU: ${calledBy(s, p)}.`,
+    `FEET: ${describeFeet(p)}`,
+    p.womb.fetuses.length ? `${p.womb.weeks} weeks pregnant.` : "",
+    p.body.lactation ? "Lactating." : "",
+    roomLine(p),
+    `DOING: ${p.assignment}${p.facility ? ` in the ${s.arcology.facilities[p.facility]?.name}` : ""}.`,
+    `FETISHES: ${fetish || "no particular fetish"}${p.persona.quirk ? ` · quirk: ${p.persona.quirk.id}` : ""}${p.persona.flaw ? ` · flaw: ${p.persona.flaw.id}` : ""}${p.persona.paraphilia ? ` · PARAPHILIA: ${p.persona.paraphilia}` : ""}.`,
+    `HOW SHE IS: ${condition(p)}, arousal ${Math.round(p.psyche.arousal)}, mood ${p.psyche.mood}.${p.psyche.active_states.length ? ` On her mind: ${p.psyche.active_states.join(", ")}.` : ""}`,
+    `TOWARD YOU: ${r.label} (${r.devotion}), ${r.trust_label} (${r.trust}). ${Math.round(r.fragility * 100)}% of her obedience is fear. Resentment ${Math.round(p.bond.resentment)}, hope ${Math.round(p.bond.hope)}.`,
+    `STANDING: ${rom.standing}${rom.dominion > -80 ? ` (${Math.round(rom.dominion)}/100 say in the household)` : ""}.`,
+    `TALKS LIKE: ${p.persona.speech_pattern}`,
+    `TRAITS: ${p.persona.core_traits.join("; ")}`,
+    p.persona.texture.length ? `LIKES AND DISLIKES: ${p.persona.texture.join("; ")}` : "",
+    mem?.episodic.length ? `SHE REMEMBERS (past weeks): ${mem.episodic.slice(-5).map(memoryLine).join(" | ")}` : "",
+    p.acts && Object.keys(p.acts).length ? `WHAT HAS BEEN DONE TO HER: ${Object.entries(p.acts).map(([a, n]) => `${a} ×${n}`).join(", ")}` : "",
+    deedsBrief(s, p.id) ? `WHAT HAS HAPPENED BETWEEN YOU (history, not the present: let it colour how she is now, never pick it back up):\n${deedsBrief(s, p.id)}` : "",
+    s.world ? `THE WORLD: ${worldBrief(s).replace(/\n/g, " ")}` : "",
+    chronicleBrief(s, [p.id], 8),
+    `THE PLACE AND TIME: ${s.arcology.name}, now week ${s.arcology.week}. ${Object.keys(s.arcology.doctrines).length ? `Its doctrine: ${Object.keys(s.arcology.doctrines).join(", ")}.` : "No doctrine adopted yet."}`,
+  ];
+  return lines.filter(Boolean).join("\n");
+}
+
+const SYSTEM = `You write one event for Free Cities, an adult text game about owning an arcology where slavery is legal and ordinary. An event is a short situation with one of the player's slaves that ends with the player having to decide what to do.
+
+Build it from her record: her fetish, her flaw, her job, her body, her room, what has been done to her, what she remembers, how she feels about you, and above all WHAT HAS ALREADY HAPPENED between you. Emergent story is the point: the best event is the next step of something already on her record (a promise you made, a punishment she hasn't got over, something left open), with consequences that follow from it. If OPEN THREADS are listed, continue one of them. It should be something that could only happen with her, this week.
+
+${HOUSE_STYLE}
+
+Do not invent people who are not on the record, except strangers with no name. Everyone is an adult.
+
+Output ONE strict JSON object and nothing else:
+{"title":"2-5 words","situation":"one or two short paragraphs, present tense, ending where you have to decide","options":[{"label":"what you do, 2-8 words","note":"short plain consequence","effect":"one id from the list","value":"optional"}],"hook":"one line: what this leaves open for later, or empty"}
+
+Three or four options, each a genuinely different response, at least one of which is to leave it alone.
+
+It is now the week named under THE PLACE AND TIME, and each turn of the game is a week. Everything on her record happened in earlier weeks and is over: do not restage it. This is the next thing, happening now.`;
+
+function effectList(): string {
+  return Object.entries(DYNAMIC_EFFECTS).map(([id, e]) => `${id} — ${e.note}`).join("\n");
+}
+
+export async function generateDynamicEvent(s: SaveState, subject?: Person, hint = ""): Promise<PendingEvent | null> {
+  if (!modelsAvailable()) return null;
+  const p = subject ?? pickSubject(s);
+  if (!p) return null;
+
+  const hooks = openHooks(s, [p.id]).slice(0, 3);
+  const res = await call({
+    system: SYSTEM,
+    user: `${dossier(s, p)}${hooks.length ? `\n\nOPEN THREADS (continue one of these if you can):\n${hooks.map((h) => `· from week ${h.week}: ${h.hook}`).join("\n")}` : ""}${hint ? `\n\nWHAT THE GAME HAS NOTICED THIS WEEK (use it): ${hint}` : ""}\n\nEFFECT IDS YOU MAY USE:\n${effectList()}\n\nACT IDS (for the "act" effect): ${Object.keys(ACT_BY_ID).join(", ")}\n\nROOM ITEM IDS: ${Object.keys(EXTRA_BY_ID).join(", ")}${p.room?.extras.length ? ` (she has: ${p.room.extras.join(", ")})` : ""}\n\n${PLAIN_RULES}\n\n${REGISTER_TAIL}`,
+    model: s.models.narrator_model,
+    fallback: s.models.fallback_model,
+    json: true,
+    maxTokens: 700,
+    temperature: 1,
+  });
+  if (!res.ok) return null;
+  const out = parseJson<GeneratedEvent>(coarsen(res.text));
+  if (!out?.situation || !Array.isArray(out.options) || out.options.length < 2) return null;
+
+  // Everything unrecognised is dropped here rather than trusted anywhere downstream.
+  const options = out.options
+    .filter((o) => o?.label && o.effect && DYNAMIC_EFFECTS[String(o.effect)])
+    .slice(0, 4)
+    .map((o, i) => ({
+      id: `d${i}:${o.effect}:${o.value ?? ""}`,
+      label: String(o.label).slice(0, 60),
+      note: o.note ? String(o.note).slice(0, 90) : undefined,
+    }));
+  if (options.length < 2) return null;
+
+  return {
+    id: `dyn-${s.arcology.week}-${p.id}`,
+    kind: "dynamic",
+    person: p.id,
+    seed: String(out.situation).slice(0, 1600),
+    options,
+    week: s.arcology.week,
+    severity: "notable",
+    written: { model: res.model, title: out.title ? String(out.title).slice(0, 60) : undefined },
+    hook: out.hook ? String(out.hook).slice(0, 200) : undefined,
+  };
+}
+
+/** Resolve a generated option. The id carries the effect and its value, so nothing has to be
+ *  stored alongside the event and a save that reloads mid-event still resolves correctly. */
+/** A follow-up with nobody of yours in it: what the effect means for the city and your name. */
+export function npcEffect(s: SaveState, effect: string, value: string | undefined, seed: string): string {
+  const std = (n: number) => { s.arcology.public_standing = clamp(s.arcology.public_standing + n, -10, 10); };
+  const who = seed.match(/\b([A-Z][a-z]+(?: [A-Z][a-z]+)?)\b/)?.[1] ?? "them";
+  switch (effect) {
+    case "cash": { const n = Number(value) || -2000; s.arcology.cash += n; return `¤${Math.abs(n).toLocaleString()} ${n < 0 ? "spent" : "made"}.`; }
+    case "rep": { const n = Number(value) || -200; s.arcology.rep = Math.max(0, s.arcology.rep + n); return `Your standing ${n >= 0 ? "rises" : "falls"} (${n >= 0 ? "+" : ""}${n}).`; }
+    case "rumor": startRumor(s, String(value ?? seed.slice(0, 120))); return "Everyone's heard about it by morning.";
+    case "promise_kept": s.arcology.rep += 250; std(1); startRumor(s, `the owner kept their word to ${who}`, { salience: 6, charge: 1 }); return `You kept your word to ${who}, and people hear about it. (+250 reputation)`;
+    case "promise_broken": s.arcology.rep = Math.max(0, s.arcology.rep - 300); std(-1); startRumor(s, `the owner went back on their word to ${who}`, { salience: 7, charge: -1 }); return `You went back on your word to ${who}. It gets around. (−300 reputation)`;
+    case "kindness": case "recognition": s.arcology.rep += 120; std(0.5); return `${who} won't forget how you treated them. (+120 reputation)`;
+    case "cruelty": case "coercion": s.arcology.rep = Math.max(0, s.arcology.rep - 100); s.arcology.crime = clamp(s.arcology.crime - 1, 0, 100); return `${who} learns what crossing you costs. People are a little more careful around you.`;
+    case "nothing": return "You let it go.";
+    default: return `You deal with ${who} and it's done.`;
+  }
+}
+
+export function resolveDynamic(s: SaveState, e: PendingEvent, optionId: string): string {
+  const p = e.person ? s.people[e.person] : undefined;
+  const [, effect, value] = optionId.split(":");
+  const def = DYNAMIC_EFFECTS[effect];
+  if (!def) return "";
+  // Not every follow-up is about a slave: a promise to a citizen, a trader, a stranger comes back
+  // too. Then the effect lands on your name in the city instead of on her.
+  const line = p ? def.run(s, p, value || undefined) : npcEffect(s, effect, value, e.seed);
+  s.events = s.events.filter((x) => x.id !== e.id);
+  const label = e.options.find((o) => o.id === optionId)?.label ?? "";
+  if (p) closeHooks(s, [p.id]);
+  chronicle(s, { keys: p ? [p.id] : ["city"], title: e.written?.title, text: `${e.seed.split(/\n/)[0].slice(0, 200)} You chose: ${label}. ${line}.`, hook: e.hook });
+  s.notifications.push({ id: `n-${e.id}`, week: s.arcology.week, text: p ? `${p.name}: ${line}` : line, kind: "info", person: p?.id, seen: false });
+  return line;
+}
+
+/** Whether the dynamic generator is pointed at a model that will actually write this material.
+ *  Surfaced in the UI rather than left as a surprise: a cloud model in the narrator slot produces
+ *  refusals and half-written scenes, and the player should be told that before they wonder why. */
+export function dynamicReadiness(s: SaveState): { ready: boolean; local: boolean; note: string } {
+  if (!modelsAvailable()) return { ready: false, local: false, note: "No model configured. Written events still happen; generated events need a model." };
+  const local = isLocalModel(s.models.narrator_model);
+  return {
+    ready: true,
+    local,
+    note: local
+      ? "Using a local model. Nothing it writes leaves your machine."
+      : "Using a hosted model. Hosted models often refuse or tone down this game's content; a local model in the narrator slot works better here.",
+  };
+}

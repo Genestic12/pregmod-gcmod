@@ -1,0 +1,55 @@
+/** Every test, one process, one exit code.
+ *  (No @types/node here on purpose — the suite bundles through esbuild and the app has no node
+ *   dependency at all, so one declaration is cheaper than a types package.) */
+declare const process: { exit(code: number): never };
+
+import "./obedience.test.ts";
+import "./kernel.test.ts";
+import "./world.test.ts";
+import "./intimacy.test.ts";
+import "./reversal.test.ts";
+import "./art.test.ts";
+import "./surgery.test.ts";
+import "./city.test.ts";
+import "./threads.test.ts";
+import "./loop.test.ts";
+import "./story.test.ts";
+import "./wardrobe.test.ts";
+import "./run.test.ts";
+import "./body.test.ts";
+import "./genitals.test.ts";
+import "./worldsim.test.ts";
+import "./moments.test.ts";
+import "./manner.test.ts";
+import "./freed.test.ts";
+import "./power.test.ts";
+import "./self.test.ts";
+import "./feet.test.ts";
+import "./plot.test.ts";
+import "./deeds.test.ts";
+import "./feetart.test.ts";
+import "./jobs.test.ts";
+import "./anatomy.test.ts";
+import "./society.test.ts";
+import "./globe.test.ts";
+import "./works.test.ts";
+import "./genome.test.ts";
+import "./menials.test.ts";
+import "./citylife.test.ts";
+import "./reign.test.ts";
+import "./tokens.test.ts";
+import "./household.test.ts";
+import "./llm.test.ts";
+import "./lawguard.test.ts";
+import "./face.test.ts";
+import "./faces.test.ts";
+import "./saga.test.ts";
+import "./pov.test.ts";
+import "./register.test.ts";
+import "./owner.test.ts";
+import "./feed.test.ts";
+import "./partner.test.ts";
+import "./living.test.ts";
+import { report } from "./harness.ts";
+
+process.exit(report() ? 1 : 0);

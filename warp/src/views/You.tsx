@@ -1,0 +1,161 @@
+/** YOU — the one character in the game whose interior the engine is not allowed to author, and
+ *  the only place you can see what your household actually thinks of you. */
+import { useGame } from "../lib/game";
+import { Button, Card, Field, Meter, Section, Stat, cx } from "../lib/ui";
+import { genderWord } from "../engine/you";
+import { selfProfile } from "../engine/self";
+import { buyTraining, householdRead, PLAYER_SKILLS, TIERS, trainingCost, type Tier } from "../engine/player";
+import { useState } from "react";
+import { unrest } from "../engine/security";
+import { read } from "../engine/obedience";
+import YourBody from "./YourBody";
+import { ReignCard, StandingOrders } from "./StandingOrders";
+
+const TIGHTNESS = ["relaxed", "a little tense", "tense", "very tense", "guarded", "completely closed off"];
+
+export default function You() {
+  const { save, mutate } = useGame();
+  const r = householdRead(save);
+  const household = Object.values(save.people).filter((p) => p.status === "owned" || p.status === "indentured");
+  const u = unrest(save);
+
+  return (
+    <>
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5 mb-6">
+        <Stat label="household" value={household.length} sub={`${household.filter((p) => p.facility).length} in facilities`} />
+        <Stat label="feared" value={Math.round(r.feared)} tone={r.feared > 60 ? "warn" : undefined} />
+        <Stat label="trusted" value={Math.round(r.trusted)} tone={r.trusted > 50 ? "good" : undefined} />
+        <Stat label="unrest" value={Math.round(u)} tone={u > 50 ? "bad" : undefined} sub="security doesn't reduce this" />
+      </div>
+
+      <ReignCard />
+
+      <Section title="What your slaves think of you">
+        <Card>
+          <p className="font-prose text-[15.5px] mb-3">You are {r.label}.</p>
+          <ul className="space-y-2 text-[13px]">
+            {r.lines.map((l, i) => <li key={i} className="flex gap-2"><span className="acc">·</span><span>{l}</span></li>)}
+          </ul>
+        </Card>
+      </Section>
+
+      <Section title="You">
+        <Card>
+          <div className="grid sm:grid-cols-2 gap-3">
+            <Field label="Name"><input value={save.player.name} onChange={(e) => mutate((s) => { s.player.name = e.target.value; })} /></Field>
+            <Field label="You are" hint="Every scene, and everyone in them, calls you this.">
+              <div className="flex flex-wrap gap-1.5">
+                {([["he/him", "a man · he"], ["she/her", "a woman · she"], ["they/them", "neither · they"]] as const).map(([k, label]) => (
+                  <button key={k} className={cx("chip !text-[12px] !py-1 !px-3", save.player.pronouns === k && "on")}
+                    onClick={() => mutate((s) => { s.player.pronouns = k; s.player.pronouns_set = true; })}>{label}</button>
+                ))}
+              </div>
+              <div className="text-[11.5px] dim mt-1.5">{genderWord(save).replace(/^./, (c) => c.toUpperCase())}.</div>
+            </Field>
+            <Field label="What your slaves call you" hint="Unless one of them has agreed to something else."><input value={save.player.address ?? ""} placeholder="Master" onChange={(e) => mutate((s) => { s.player.address = e.target.value || undefined; })} /></Field>
+          </div>
+          <Field label="Your appearance" hint="The narrator uses this exactly as written.">
+            <textarea rows={2} value={save.player.body.appearance_facts}
+              onChange={(e) => mutate((s) => { s.player.body.appearance_facts = e.target.value; })} />
+          </Field>
+        </Card>
+      </Section>
+
+      <Section title="Who you are">
+        <WhoYouAre />
+      </Section>
+
+      <Section title="Standing orders">
+        <StandingOrders />
+      </Section>
+
+      <Section title="Your body">
+        <YourBody />
+      </Section>
+
+      <Section title="What you are good at">
+        <Skills />
+      </Section>
+
+      <Section title="How reserved you are">
+        <Card>
+          <div className="text-[12px] dim mb-3">Limits how emotionally open the narrator writes you.</div>
+          <input type="range" min={0} max={5} value={save.player.tightness ?? 0}
+            onChange={(e) => mutate((s) => { s.player.tightness = Number(e.target.value); })} />
+          <div className="text-[12px] mid mt-1">{TIGHTNESS[save.player.tightness ?? 0]}</div>
+        </Card>
+      </Section>
+
+      <Section title="Your most attached slaves">
+        <div className="space-y-1.5">
+          {household
+            .map((p) => ({ p, r: read(p, save.memory[p.id]) }))
+            .sort((a, b) => b.p.bond.bond - a.p.bond.bond)
+            .slice(0, 6)
+            .map(({ p, r: pr }) => (
+              <div key={p.id} className="card-2 px-3 py-2 flex items-center gap-3">
+                <span className="text-[13px] flex-1">{p.name}</span>
+                <span className="text-[11px] dim">{pr.fragility > 0.6 ? "held by fear" : p.bond.bond > 25 ? "held by the bond" : "held by neither, particularly"}</span>
+                <div className="w-24"><Meter value={p.bond.bond} range={[-100, 100]} showValue={false} /></div>
+              </div>
+            ))}
+        </div>
+      </Section>
+    </>
+  );
+}
+
+/** Your skills, what each one does, and money for getting better at them faster than practice. */
+function Skills() {
+  const { save, mutate } = useGame();
+  const [open, setOpen] = useState<string | null>(null);
+  const [said, setSaid] = useState("");
+  const t = save.player.training;
+  return (
+    <Card>
+      {t ? <div className="text-[12.5px] acc mb-3">{TIERS[t.tier].name} in {PLAYER_SKILLS.find((x) => x.id === t.skill)?.name.toLowerCase()}: {t.left} week{t.left === 1 ? "" : "s"} to go.</div> : null}
+      {said ? <div className="text-[12.5px] mid mb-3">{said}</div> : null}
+      <div className="space-y-3">
+        {PLAYER_SKILLS.map((sk) => (
+          <div key={sk.id}>
+            <button className="w-full text-left" onClick={() => setOpen(open === sk.id ? null : sk.id)}>
+              <Meter value={save.player.skills[sk.id] ?? 0} label={`${sk.name} · ${Math.round(save.player.skills[sk.id] ?? 0)}`} />
+            </button>
+            <div className="text-[11px] dim mt-0.5">{sk.does}</div>
+            {open === sk.id ? (
+              <div className="mt-2 space-y-1.5 fade-in">
+                {(Object.keys(TIERS) as Tier[]).map((tier) => {
+                  const cost = trainingCost(save, sk.id, tier);
+                  const busy = !!TIERS[tier].weeks && !!t;
+                  return (
+                    <button key={tier} className="choice" disabled={busy || save.arcology.cash < cost} onClick={() => { let r = { ok: false, line: "" }; mutate((s) => { r = buyTraining(s, sk.id, tier); }); setSaid(r.line); setOpen(null); }}>
+                      <span className="block text-[13.5px] leading-snug">{TIERS[tier].name} · ¤{cost.toLocaleString()}{TIERS[tier].weeks ? ` · ${TIERS[tier].weeks} weeks` : " · today"}</span>
+                      <span className="block text-[11.5px] dim mt-0.5">{TIERS[tier].note} About +{TIERS[tier].gain}, less the better you already are.</span>
+                    </button>
+                  );
+                })}
+              </div>
+            ) : null}
+          </div>
+        ))}
+      </div>
+      <div className="text-[11px] dim mt-3">Tap a skill to pay for training. You also get better at each by doing it.</div>
+    </Card>
+  );
+}
+
+/** What the narrator reads about your character: your own words, and what your record says. */
+function WhoYouAre() {
+  const { save, mutate } = useGame();
+  const read = selfProfile({ ...save, player: { ...save.player, self: "" } });
+  return (
+    <Card>
+      <Field label="In your own words" hint="How you are with people, how you talk, what you're like with the ones you defer to. Every scene writes you this way; it wins over the record below.">
+        <textarea rows={3} value={save.player.self ?? ""} placeholder="e.g. Quiet and courteous with everyone. Generous with the household. With Sabine I'm hers: I ask permission and I mean it."
+          onChange={(e) => mutate((s) => { s.player.self = e.target.value || undefined; })} />
+      </Field>
+      <div className="text-[11px] uppercase tracking-wider dim mt-3 mb-1">What your record tells the narrator</div>
+      <ul className="space-y-1">{read.map((l, i) => <li key={i} className="text-[12.5px] mid flex gap-2"><span className="acc">·</span><span>{l}</span></li>)}</ul>
+    </Card>
+  );
+}

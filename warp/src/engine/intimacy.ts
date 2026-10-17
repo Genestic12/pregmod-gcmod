@@ -1,0 +1,329 @@
+/**
+ * THE INTERACTION — what an hour with her actually does.
+ *
+ * This is the core loop of the game and everything else is scaffolding around it. One entry point,
+ * `resolveAct`, takes a person and a thing you are doing to her and returns what it did: to her
+ * arousal, to her nervous system, to what she is carrying about you, to her skills, and to what
+ * she now knows about herself. It also returns the DIRECTIVE — the block of law the narrator gets
+ * so the prose on the page is the same event the numbers just recorded.
+ *
+ * THE CLAIM. An act is not an increment. The same hour lands three different ways:
+ *
+ *   · IT HITS HER FETISH. Arousal, relaxation and bond all move up together, resentment goes
+ *     negative, and the fetish gets stronger — which is how a preference becomes a paraphilia over
+ *     a long enough campaign.
+ *   · IT HITS HER FLAW. She does it. She hates it. Resentment lands at three times the base and
+ *     the nervous system takes a real hit — and if you keep going, the flaw WEARS, and somewhere on
+ *     the other side of that is a woman with the matching quirk who asks for it. That road is the
+ *     most expensive thing in the game and it is supposed to be.
+ *   · IT HITS NEITHER. It is a Tuesday. She is somewhere else while it happens, and the record
+ *     says so.
+ *
+ * Nothing here writes prose. It writes the facts the prose has to honour.
+ */
+import { footAct } from "./podolatry";
+import { sane, recoveryNote } from "./health";
+import { erection, feetOf, mobility } from "./genitals";
+import type { Person, SaveState } from "./types";
+import { ACT_BY_ID, FETISH_BY_ID, FLAW_BY_ID, QUIRK_BY_ID, type ActDef } from "../data/intimacy";
+import { clamp, shove, addState } from "./psyche";
+import { applyTreatment, read } from "./obedience";
+import { remember } from "./memory";
+import { moveEdge } from "./social";
+import { canSire, hasCock } from "./you";
+
+export interface ActOutcome {
+  act: string;
+  /** What her body did with it. */
+  arousal: number;
+  relaxation: number;
+  /** Whether she got there. */
+  finished: boolean;
+  /** How it landed: the one word the UI colours by. */
+  landing: "wanted" | "willing" | "endured" | "hated" | "nothing";
+  /** Why it landed that way, in her terms, for the panel and for the narrator. */
+  because: string;
+  bond: number;
+  resentment: number;
+  /** Fetish or quirk discovered this time. */
+  discovered?: string;
+  /** A flaw that wore down, or converted. */
+  converted?: string;
+  /** What the foot-worshippers of the arcology made of it, when there are any. */
+  believers?: string;
+  /** True the first time this has ever been done to her. */
+  first: boolean;
+  /** Skills that moved. */
+  trained: Record<string, number>;
+  /** What she will carry, if anything. */
+  memory?: string;
+}
+
+/** Can this even be done to this body? Returns the reason it cannot, or null. */
+export function canDo(p: Person, act: ActDef, s?: SaveState): string | null {
+  for (const need of act.needs ?? []) {
+    switch (need) {
+      case "mouth": if (p.body.voice === 0 && p.body.teeth === "removable") break; break;
+      case "vagina": if (p.body.vagina === null) return "she has no cunt"; if (p.chastity.vagina) return "she is locked"; break;
+      case "anus": if (p.chastity.anus) return "she is locked"; break;
+      case "dick": if (p.body.dick === null || p.body.dick === 0) return "she has no cock"; if (p.chastity.penis) return "she is locked"; break;
+      case "breasts": if (p.body.boobs < 200) return "there is nothing there to use"; break;
+      case "milk": if (!p.body.lactation) return "she is not lactating"; break;
+      case "balls": if (p.body.balls === null || p.body.balls === 0) return "she has nothing to empty"; break;
+      case "feet": if (p.body.marks.some((m) => m.kind === "prosthetic" && /leg|foot|feet/i.test(m.where))) break;
+        if (p.health.recovery_weeks > 2) return "she can't stand well enough yet"; break;
+      case "pregnant": if (!p.womb.fetuses.length) return "she is not carrying"; break;
+      case "belly": if (p.body.belly < 4000) return "there is not enough of her yet"; break;
+      case "nipples": if (p.body.nipples !== "fuckable") return "her nipples aren't fuckable"; break;
+      case "hard": { const e = erection(p); if (e === "none") return p.chastity.penis ? "her cock is caged" : "she has no cock"; if (e === "soft") return "she can't get hard"; break; }
+      case "prostate": if (!p.body.prostate) return "she has no prostate"; if (p.chastity.anus) return "her ass is locked"; break;
+      case "clit": if (p.body.vagina === null || p.body.clit < 3) return "her clit isn't big enough"; if (p.chastity.vagina) return "she is locked"; break;
+      case "caged": if (!p.body.dick || !p.chastity.penis) return "her cock isn't caged"; break;
+      case "ticklish": if (feetOf(p).ticklish === 0) return "she isn't ticklish"; break;
+      case "standing": if (feetOf(p).heels_clipped) return "her tendons are clipped; she can't stand flat"; if (mobility(p).level >= 2) return "she can't stand under her own weight"; break;
+    }
+  }
+  if (sane(p.health.recovery_weeks) > 0 && act.group !== "tenderness") return s ? `she is ${recoveryNote(s, p)}` : "she is recovering from surgery";
+  if (s && act.you === "cock" && !hasCock(s)) return "you have no cock";
+  if (s && act.you === "sire" && !canSire(s)) return hasCock(s) ? "you can't get anyone pregnant" : "you have no cock";
+  return null;
+}
+
+/** How strongly this act hits what she is into. −1 (her flaw) … +1 (her fetish). */
+export function affinity(p: Person, act: ActDef): { score: number; why: string } {
+  let score = 0;
+  let why = "";
+
+  const flaw = p.persona.flaw ? FLAW_BY_ID[p.persona.flaw.id] : undefined;
+  // Hating giving head says nothing about being sucked off; only her receiving-side flaws apply.
+  const flawBites = flaw && !(act.receives && flaw.id === "hates oral");
+  if (flaw && flawBites && act.tags.some((t) => flaw.hates.includes(t))) {
+    // The flaw wears: a woman who has been made to do it two hundred times minds less than one who
+    // has been made to do it twice, and that is the road to converting it.
+    const worn = clamp((p.persona.flaw?.worn ?? 0) / 120, 0, 0.75);
+    score -= 1 - worn;
+    why = `${flaw.id} — ${flaw.note}`;
+  }
+
+  const quirk = p.persona.quirk ? QUIRK_BY_ID[p.persona.quirk.id] : undefined;
+  if (quirk && (quirk.acts.includes("anything") || act.tags.some((t) => quirk.acts.includes(t)))) {
+    score += 0.5;
+    why = why || `${quirk.id} — ${quirk.note}`;
+  }
+
+  for (const f of p.persona.fetishes) {
+    const def = FETISH_BY_ID[f.name];
+    if (!def) continue;
+    if (act.tags.some((t) => def.acts.includes(t)) || def.acts.includes(act.id)) {
+      score += (f.strength / 100) * (p.persona.paraphilia === def.becomes ? 1.4 : 1);
+      why = `${def.name} — ${def.note}`;
+    }
+  }
+
+  // Tenderness lands on anyone who has any bond at all, and lands hardest on the ones who have been
+  // given nothing. The engine's one soft spot, and it is deliberate.
+  if (act.group === "tenderness") {
+    score += clamp(0.25 + p.bond.bond / 200 + (p.bond.weeks_since_kindness > 6 ? 0.25 : 0), 0, 0.8);
+    if (!why) why = "nobody has been this nice to her in a long time";
+  }
+
+  return { score: clamp(score, -1.5, 1.5), why };
+}
+
+export function resolveAct(s: SaveState, p: Person, actId: string, opts?: { public?: boolean; withId?: string }): ActOutcome | { error: string } {
+  const act = ACT_BY_ID[actId];
+  if (!act) return { error: "no such act" };
+  const blocked = canDo(p, act, s);
+  if (blocked) return { error: blocked };
+
+  const week = s.arcology.week;
+  p.acts = p.acts ?? {};
+  p.firsts = p.firsts ?? {};
+  const done = p.acts[actId] ?? 0;
+  const first = done === 0;
+  if (first) p.firsts[actId] = week;
+  p.acts[actId] = done + 1;
+
+  const aff = affinity(p, act);
+  const r = read(p, s.memory[p.id]);
+  const willing = act.wants_devotion === undefined || r.devotion >= act.wants_devotion;
+
+  // AROUSAL. Wanting it is most of it; a body that is already wound up needs less.
+  const arousalDelta = Math.round(act.base.arousal * (1 + aff.score) * (1 + p.psyche.libido / 200));
+  p.psyche.arousal = clamp(p.psyche.arousal + arousalDelta, 0, 100);
+
+  // Getting there. An act that gives release does it; otherwise a body at the top can tip on its own.
+  const finished = act.base.arousal < 0 || (p.psyche.arousal >= 95 && aff.score > 0.2);
+  if (finished) {
+    p.psyche.arousal = clamp(p.psyche.arousal - 60, 0, 100);
+    shove(p.psyche, 0.8);
+  }
+
+  // THE NERVOUS SYSTEM. The base, bent by whether she wanted it, and doubled against her when it is
+  // the thing she cannot stand.
+  const relBase = act.base.relaxation;
+  const rel = relBase >= 0
+    ? relBase * (1 + Math.max(0, aff.score))
+    : relBase * (aff.score < 0 ? 1 + Math.abs(aff.score) * 1.6 : Math.max(0.15, 1 - aff.score));
+  const relaxation = shove(p.psyche, rel + (opts?.public ? -0.4 : 0));
+
+  // WHAT SHE CARRIES. Bond and resentment move in opposite directions depending on the same score.
+  const bond = act.base.bond + aff.score * 3 + (willing ? 0 : -1.5);
+  const resent = Math.max(0, act.base.resentment * (aff.score < 0 ? 3 : aff.score > 0.5 ? 0 : 1) + (willing ? 0 : 2) + (opts?.public ? 2 : 0));
+  p.bond.bond = clamp(p.bond.bond + bond * 0.6, -100, 100);
+  p.bond.resentment = clamp(p.bond.resentment + resent * 0.7, 0, 100);
+  if (bond > 1.5) { p.bond.weeks_since_kindness = 0; p.bond.hope = clamp(p.bond.hope + bond * 0.4, 0, 100); }
+  if (resent > 5) p.bond.weeks_since_cruelty = 0;
+
+  // SKILLS. She gets better at the thing she is made to do, whether or not she wants to be.
+  const trained: Record<string, number> = {};
+  for (const [k, rate] of Object.entries(act.trains ?? {})) {
+    const key = k as keyof typeof p.skills;
+    if (typeof p.skills[key] === "number") {
+      const gain = rate * (1 + aff.score * 0.4);
+      (p.skills[key] as number) = clamp((p.skills[key] as number) + gain, 0, 100);
+      trained[k] = +gain.toFixed(1);
+    }
+  }
+
+  // DISCOVERY. You find out what she is into by doing it to her and watching, which is the only way
+  // anybody has ever found out.
+  let discovered: string | undefined;
+  for (const f of p.persona.fetishes) {
+    const def = FETISH_BY_ID[f.name];
+    if (!def || f.known) continue;
+    if (act.tags.some((t) => def.acts.includes(t)) && f.strength >= 40) {
+      f.known = true;
+      discovered = `she's a ${def.name}`;
+    }
+  }
+  if (!discovered && p.persona.quirk && !p.persona.quirk.known) {
+    const q = QUIRK_BY_ID[p.persona.quirk.id];
+    if (q && act.tags.some((t) => q.acts.includes(t))) {
+      p.persona.quirk.known = true;
+      discovered = `she is a ${p.persona.quirk.id}`;
+    }
+  }
+  if (!discovered && p.persona.flaw && !p.persona.flaw.known && aff.score < -0.3) {
+    p.persona.flaw.known = true;
+    discovered = `she ${p.persona.flaw.id}`;
+  }
+
+  // THE LONG ROAD. Keep doing the thing she cannot stand and the flaw wears; far enough down that
+  // road and it flips into the quirk that is its mirror image.
+  let converted: string | undefined;
+  if (p.persona.flaw && aff.score < 0) {
+    p.persona.flaw.worn = (p.persona.flaw.worn ?? 0) + 1;
+    const def = FLAW_BY_ID[p.persona.flaw.id];
+    if (def?.softens_to && p.persona.flaw.worn >= 120) {
+      converted = `${p.persona.flaw.id} → ${def.softens_to}`;
+      p.persona.quirk = { id: def.softens_to, known: true };
+      delete p.persona.flaw;
+      addState(p.psyche, `no longer hates ${def.hates[0] ?? "it"}`, week);
+    }
+  }
+  // And a fetish that is fed forever stops being a preference.
+  for (const f of p.persona.fetishes) {
+    if (aff.score <= 0.2) continue;
+    const def = FETISH_BY_ID[f.name];
+    if (!def?.becomes) continue;
+    f.strength = clamp(f.strength + 0.6, 0, 130);
+    if (f.strength >= 110 && p.persona.paraphilia !== def.becomes) {
+      p.persona.paraphilia = def.becomes;
+      converted = converted ?? `${def.name} → ${def.becomes}`;
+    }
+  }
+
+  // HOW IT LANDED, in one word.
+  const landing: ActOutcome["landing"] =
+    aff.score > 0.55 ? "wanted" :
+    aff.score < -0.4 ? "hated" :
+    aff.score > 0.1 ? "willing" :
+    resent > 3 ? "endured" : "nothing";
+
+  // WHAT SHE WILL CARRY. A first is always worth remembering; the four hundredth almost never is.
+  let memoryLine: string | undefined;
+  const mem = s.memory[p.id];
+  if (mem) {
+    if (first) {
+      memoryLine = `the first time — ${act.what}`;
+      remember(mem, { content: memoryLine, week, importance: landing === "hated" ? 9 : 6, charge: landing === "hated" ? "sharp" : landing === "wanted" ? "bright" : "dull", core: landing === "hated" || landing === "wanted", where: s.scene.location });
+    } else if (landing === "hated" || landing === "wanted" || act.group === "tenderness") {
+      memoryLine = `${act.what}${landing === "hated" ? ", and she hasn't forgiven it" : ""}`;
+      remember(mem, { content: memoryLine, week, importance: landing === "hated" ? 7 : 5, charge: landing === "hated" ? "sharp" : "warm", where: s.scene.location });
+    }
+  }
+
+  // The treatment ledger, so the same act shows up in the report and in her devotion for the right
+  // reason rather than as an unexplained number.
+  if (landing === "hated") applyTreatment(p, { kind: "cruelty", size: Math.min(8, 2 + resent / 3), why: act.what }, week);
+  else if (act.group === "tenderness") applyTreatment(p, { kind: "kindness", size: 3, why: act.what }, week);
+  else if (landing === "wanted") applyTreatment(p, { kind: "recognition", size: 2, why: `you gave her ${act.name.toLowerCase()}` }, week);
+
+  // Acts that leave something on her body.
+  if (actId === "pedicure") {
+    const colours = ["red", "pink", "black", "white", "gold", "pale pink", "deep purple", "navy blue"];
+    feetOf(p).toenails = colours[(p.acts[actId] + p.id.length) % colours.length];
+    feetOf(p).soles = "soft";
+  }
+  if (actId === "bastinado") p.health.health = clamp(p.health.health - 3, -100, 100);
+  if (actId === "cbt") p.health.health = clamp(p.health.health - 2, -100, 100);
+  const believers = act.tags.includes("feet") ? footAct(s, p, actId, !!opts?.public) : undefined;
+
+  moveEdge(s.edges, p.id, "owner", { warmth: bond, attraction: aff.score > 0.4 ? 2 : 0 });
+  if (opts?.withId) moveEdge(s.edges, p.id, opts.withId, { warmth: landing === "hated" ? -3 : 1 });
+
+  return {
+    act: actId, arousal: arousalDelta, relaxation, finished, landing,
+    because: aff.why || "it doesn't match anything she's into",
+    bond: +bond.toFixed(2), resentment: +resent.toFixed(2),
+    discovered, converted, first, trained, memory: memoryLine, believers,
+  };
+}
+
+/** THE DIRECTIVE — what the narrator is told, so the prose is the same event as the numbers. It
+ *  names the act, who it is done to, and how she takes it, and asks for that act to be written. */
+export function actDirective(s: SaveState, p: Person, out: ActOutcome): string {
+  const act = ACT_BY_ID[out.act];
+  const times = p.acts?.[out.act] ?? 1;
+  const lines: string[] = [];
+  lines.push(`## THE PLAYER'S ACTION: ${act.name.toUpperCase()} (${p.name})`);
+  lines.push(`What that means: ${act.what}.`);
+  if (out.believers) lines.push(`The arcology holds slaves' feet sacred. ${out.believers} She knows it too, and it shows in how she takes it.`);
+  lines.push(out.first ? `This is the first time you have done this with her.` : `You have done this with her ${times} time${times === 1 ? "" : "s"} before.`);
+  lines.push(act.receives
+    ? `WHO DOES WHAT: you do this TO ${p.name}. She is on the receiving end and you are serving her. She does not do it to you.`
+    : act.group === "hers" || act.tags.includes("domination")
+      ? `WHO DOES WHAT: ${p.name} is the active one here; she does this to you.`
+      : `WHO DOES WHAT: you do this to ${p.name}, or have her do it for you, exactly as described above.`);
+  lines.push(`Her genitals and feet are on her card under BETWEEN HER LEGS and FEET. Use exactly what is there.`);
+  lines.push(`Write the owner doing it in their own manner (WHO THE OWNER IS), and her as the power between you really stands (THE POWER BETWEEN YOU on her card): however she takes it based on her character, age, personality, an owned slave shows it the way a slave would, not by telling her owner off.`);
+  lines.push(`Write this act happening with ${p.name}, from start to finish. It is the whole scene. Do not write a scene about something else.`);
+  lines.push(``);
+  lines.push(`## HOW SHE TAKES IT (decided by the game; write it this way)`);
+  switch (out.landing) {
+    case "wanted": lines.push(`She loves it. ${out.because}. Say so, and show her enjoying it.`); break;
+    case "willing": lines.push(`She's happy enough to go along with it.`); break;
+    case "endured": lines.push(`She puts up with it because she has to. She does what's expected and doesn't enjoy it.`); break;
+    case "hated": lines.push(`She hates it. ${out.because}. She obeys because she's a slave, and it's obvious how much she hates it.`); break;
+    default: lines.push(`It does nothing for her either way.`); break;
+  }
+  const sexual = act.group !== "tenderness" || act.base.release > 0 || out.finished;
+  if (sexual) lines.push(`Arousal: ${p.psyche.arousal >= 70 ? "she's very turned on" : p.psyche.arousal >= 35 ? "she's getting turned on" : "she isn't turned on"}. ${out.finished ? "She orgasms." : "She doesn't orgasm."}`);
+  if (out.discovered) lines.push(`You find out that ${out.discovered}. Write the moment it becomes obvious.`);
+  if (out.converted) lines.push(`This changes her for good: ${out.converted}.`);
+  lines.push(``);
+  lines.push(sexual
+    ? `Write it explicitly, in the game's own words. No fade to black, no cutting away, no moralizing.`
+    : `Write it plainly and concretely: what you do, what she does, what is said.`);
+  return lines.join("\n");
+}
+
+/** Everything you could do to her right now, with the reason each blocked one is blocked. */
+export function availableActs(p: Person, s?: SaveState): { act: ActDef; blocked: string | null; affinity: number }[] {
+  return Object.values(ACT_BY_ID).map((act) => ({
+    act,
+    blocked: canDo(p, act, s),
+    affinity: affinity(p, act).score,
+  }));
+}
